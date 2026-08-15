@@ -102,10 +102,13 @@ jobs:
             -e POSTGRES_PASSWORD=test-password \
             postgres:16-alpine
           for attempt in $(seq 1 60); do
-            if docker exec "$container" pg_isready -U dujiao -d dujiao_next >/dev/null 2>&1; then break; fi
+            if docker exec "$container" psql -U dujiao -d dujiao_next -Atc 'SELECT 1' >/dev/null 2>&1; then
+              sleep 2
+              if docker exec "$container" psql -U dujiao -d dujiao_next -Atc 'SELECT 1' >/dev/null 2>&1; then break; fi
+            fi
             sleep 1
           done
-          docker exec "$container" pg_isready -U dujiao -d dujiao_next
+          docker exec "$container" psql -U dujiao -d dujiao_next -Atc 'SELECT 1'
           docker exec "$container" psql -U dujiao -d dujiao_next -v ON_ERROR_STOP=1 \
             -c "CREATE TABLE products(id bigint PRIMARY KEY, name text); INSERT INTO products VALUES (1, 'test');"
           sudo install -d -m 0700 /opt/dujiao-backup
