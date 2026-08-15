@@ -1,0 +1,135 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n dujiao-backup.sh
+      - name: ShellCheck
+        run: shellcheck -x dujiao-backup.sh
+      - name: Built-in self test
+        run: bash dujiao-backup.sh self-test
+      - name: Version contract
+        run: test "$(bash dujiao-backup.sh version)" = "1.1.3"
+
+  debian:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image:
+          - debian:bookworm-slim
+          - debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test in Debian
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo:ro" \
+            -w /repo \
+            "${{ matrix.image }}" \
+            bash -c 'bash -n dujiao-backup.sh && bash dujiao-backup.sh self-test'
+
+  sqlite-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SQLite
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Create a complete SQLite backup and enforce retention
+        run: |
+          set -Eeuo pipefail
+          app_dir=/tmp/dujiao-next-sqlite-test
+          fake_bin=/tmp/dujiao-backup-fake-bin
+          sudo install -d -m 0700 /opt/dujiao-backup
+          mkdir -p "$app_dir/config" "$app_dir/data/db" "$app_dir/data/uploads" "$fake_bin"
+          printf 'TAG=latest\n' > "$app_dir/.env"
+          printf 'database:\n  driver: sqlite\n' > "$app_dir/config/config.yml"
+          printf 'services: {}\n' > "$app_dir/docker-compose.sqlite.yml"
+          printf 'image-data\n' > "$app_dir/data/uploads/product.jpg"
+          sqlite3 "$app_dir/data/db/dujiao.db" \
+            'CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO products(name) VALUES ("test");'
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'if [[ "$1" == "inspect" ]]; then' \
+            '  [[ "${2:-}" == "--format" ]] && printf "dujiaonext/dujiao-next:latest\n"' \
+            '  exit 0' \
+            'fi' \
+            'exit 1' > "$fake_bin/docker"
+          chmod 0755 "$fake_bin/docker"
+          printf '%s\n' \
+            "APP_DIR=$app_dir" \
+            'DEPLOY_MODE=sqlite' \
+            "COMPOSE_FILE=$app_dir/docker-compose.sqlite.yml" \
+            "DB_FILE=$app_dir/data/db/dujiao.db" \
+            'MAX_BACKUPS=1' \
+            'OSS_ENABLED=0' \
+            'SFTP_ENABLED=0' > /tmp/dujiao-test-config
+          sudo install -m 0600 /tmp/dujiao-test-config /opt/dujiao-backup/config.conf
+          sudo env "PATH=$fake_bin:$PATH" bash dujiao-backup.sh backup
+          sudo env "PATH=$fake_bin:$PATH" bash dujiao-backup.sh verify
+          sleep 1
+          sqlite3 "$app_dir/data/db/dujiao.db" 'INSERT INTO products(name) VALUES ("second");'
+          sudo env "PATH=$fake_bin:$PATH" bash dujiao-backup.sh backup
+          test "$(sudo find /opt/dujiao-backup/backups -maxdepth 1 -name 'dujiao-next-*.tar' | wc -l)" -eq 1
+          latest="$(sudo find /opt/dujiao-backup/backups -maxdepth 1 -name 'dujiao-next-*.tar' | head -n 1)"
+          sudo tar -tf "$latest" | diff -u \
+            <(printf '%s\n' database.sqlite uploads.tar.gz config.tar.gz manifest.txt SHA256SUMS) -
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and restore a PostgreSQL custom dump
+        run: |
+          set -Eeuo pipefail
+          app_dir=/tmp/dujiao-next-postgres-test
+          container=dujiaonext-postgres
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$container" \
+            -e POSTGRES_DB=dujiao_next \
+            -e POSTGRES_USER=dujiao \
+            -e POSTGRES_PASSWORD=test-password \
+            postgres:16-alpine
+          for attempt in $(seq 1 60); do
+            if docker exec "$container" pg_isready -U dujiao -d dujiao_next >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec "$container" pg_isready -U dujiao -d dujiao_next
+          docker exec "$container" psql -U dujiao -d dujiao_next -v ON_ERROR_STOP=1 \
+            -c "CREATE TABLE products(id bigint PRIMARY KEY, name text); INSERT INTO products VALUES (1, 'test');"
+          sudo install -d -m 0700 /opt/dujiao-backup
+          mkdir -p "$app_dir/config" "$app_dir/data/uploads"
+          printf 'TAG=latest\n' > "$app_dir/.env"
+          printf 'database:\n  driver: postgres\n' > "$app_dir/config/config.yml"
+          printf 'services: {}\n' > "$app_dir/docker-compose.postgres.yml"
+          printf 'image-data\n' > "$app_dir/data/uploads/product.jpg"
+          printf '%s\n' \
+            "APP_DIR=$app_dir" \
+            'DEPLOY_MODE=postgres' \
+            "COMPOSE_FILE=$app_dir/docker-compose.postgres.yml" \
+            "PG_CONTAINER=$container" \
+            'MAX_BACKUPS=2' \
+            'OSS_ENABLED=0' \
+            'SFTP_ENABLED=0' > /tmp/dujiao-test-config
+          sudo install -m 0600 /tmp/dujiao-test-config /opt/dujiao-backup/config.conf
+          sudo bash dujiao-backup.sh backup
+          sudo bash dujiao-backup.sh verify
+          latest="$(sudo find /opt/dujiao-backup/backups -maxdepth 1 -name 'dujiao-next-*.tar' | head -n 1)"
+          mkdir -p /tmp/dujiao-restore-check
+          sudo tar -xf "$latest" -C /tmp/dujiao-restore-check database.dump
+          sudo chmod 0644 /tmp/dujiao-restore-check/database.dump
+          docker exec "$container" createdb -U dujiao restore_test
+          docker exec -i "$container" pg_restore -U dujiao -d restore_test \
+            < /tmp/dujiao-restore-check/database.dump
+          test "$(docker exec "$container" psql -U dujiao -d restore_test -Atc 'SELECT count(*) FROM products')" = "1"
