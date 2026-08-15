@@ -754,7 +754,7 @@ pin_sftp_host_key() {
 }
 
 sftp_ssh() {
-  ssh \
+  ssh -n \
     -i "$SFTP_KEY_FILE" \
     -p "$SFTP_PORT" \
     -o BatchMode=yes \
