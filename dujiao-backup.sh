@@ -180,75 +180,75 @@ pause_for_enter() {
 }
 
 prompt_text() {
-  local variable_name="$1"
-  local prompt="$2"
-  local default_value="$3"
-  local required="$4"
-  local value
+  local prompt_text_variable_name="$1"
+  local prompt_text_message="$2"
+  local prompt_text_default="$3"
+  local prompt_text_required="$4"
+  local prompt_text_input
   require_tty
   while true; do
-    if [[ -n "$default_value" ]]; then
-      printf '%s [%s]: ' "$prompt" "$default_value" > /dev/tty
+    if [[ -n "$prompt_text_default" ]]; then
+      printf '%s [%s]: ' "$prompt_text_message" "$prompt_text_default" > /dev/tty
     else
-      printf '%s: ' "$prompt" > /dev/tty
+      printf '%s: ' "$prompt_text_message" > /dev/tty
     fi
-    IFS= read -r value < /dev/tty
-    [[ -n "$value" ]] || value="$default_value"
-    if [[ "$required" -eq 1 && -z "$value" ]]; then
+    IFS= read -r prompt_text_input < /dev/tty
+    [[ -n "$prompt_text_input" ]] || prompt_text_input="$prompt_text_default"
+    if [[ "$prompt_text_required" -eq 1 && -z "$prompt_text_input" ]]; then
       printf '此项不能为空，请重新输入。\n' > /dev/tty
       continue
     fi
-    printf -v "$variable_name" '%s' "$value"
+    printf -v "$prompt_text_variable_name" '%s' "$prompt_text_input"
     return 0
   done
 }
 
 prompt_secret() {
-  local variable_name="$1"
-  local prompt="$2"
-  local existing_value="$3"
-  local value
+  local prompt_secret_variable_name="$1"
+  local prompt_secret_message="$2"
+  local prompt_secret_existing="$3"
+  local prompt_secret_input
   require_tty
   while true; do
-    if [[ -n "$existing_value" ]]; then
-      printf '%s（直接回车保留现有值）: ' "$prompt" > /dev/tty
+    if [[ -n "$prompt_secret_existing" ]]; then
+      printf '%s（直接回车保留现有值）: ' "$prompt_secret_message" > /dev/tty
     else
-      printf '%s: ' "$prompt" > /dev/tty
+      printf '%s: ' "$prompt_secret_message" > /dev/tty
     fi
-    IFS= read -r -s value < /dev/tty
+    IFS= read -r -s prompt_secret_input < /dev/tty
     printf '\n' > /dev/tty
-    [[ -n "$value" ]] || value="$existing_value"
-    if [[ -z "$value" ]]; then
+    [[ -n "$prompt_secret_input" ]] || prompt_secret_input="$prompt_secret_existing"
+    if [[ -z "$prompt_secret_input" ]]; then
       printf '此项不能为空，请重新输入。\n' > /dev/tty
       continue
     fi
-    printf -v "$variable_name" '%s' "$value"
+    printf -v "$prompt_secret_variable_name" '%s' "$prompt_secret_input"
     return 0
   done
 }
 
 prompt_yes_no() {
-  local variable_name="$1"
-  local prompt="$2"
-  local default_value="$3"
-  local suffix answer
+  local prompt_yes_no_variable_name="$1"
+  local prompt_yes_no_message="$2"
+  local prompt_yes_no_default="$3"
+  local prompt_yes_no_suffix prompt_yes_no_answer
   require_tty
-  [[ "$default_value" == "1" ]] && suffix="Y/n" || suffix="y/N"
+  [[ "$prompt_yes_no_default" == "1" ]] && prompt_yes_no_suffix="Y/n" || prompt_yes_no_suffix="y/N"
   while true; do
-    printf '%s [%s]: ' "$prompt" "$suffix" > /dev/tty
-    IFS= read -r answer < /dev/tty
-    answer="${answer,,}"
-    if [[ -z "$answer" ]]; then
-      printf -v "$variable_name" '%s' "$default_value"
+    printf '%s [%s]: ' "$prompt_yes_no_message" "$prompt_yes_no_suffix" > /dev/tty
+    IFS= read -r prompt_yes_no_answer < /dev/tty
+    prompt_yes_no_answer="${prompt_yes_no_answer,,}"
+    if [[ -z "$prompt_yes_no_answer" ]]; then
+      printf -v "$prompt_yes_no_variable_name" '%s' "$prompt_yes_no_default"
       return 0
     fi
-    case "$answer" in
+    case "$prompt_yes_no_answer" in
       y|yes|1|是)
-        printf -v "$variable_name" '%s' "1"
+        printf -v "$prompt_yes_no_variable_name" '%s' "1"
         return 0
         ;;
       n|no|0|否)
-        printf -v "$variable_name" '%s' "0"
+        printf -v "$prompt_yes_no_variable_name" '%s' "0"
         return 0
         ;;
       *) printf '请输入 y 或 n。\n' > /dev/tty ;;
@@ -257,41 +257,41 @@ prompt_yes_no() {
 }
 
 prompt_choice() {
-  local variable_name="$1"
-  local prompt="$2"
-  local minimum="$3"
-  local maximum="$4"
-  local default_value="$5"
-  local value
+  local prompt_choice_variable_name="$1"
+  local prompt_choice_message="$2"
+  local prompt_choice_minimum="$3"
+  local prompt_choice_maximum="$4"
+  local prompt_choice_default="$5"
+  local prompt_choice_input
   require_tty
   while true; do
-    printf '%s [%s]: ' "$prompt" "$default_value" > /dev/tty
-    IFS= read -r value < /dev/tty
-    value="${value:-$default_value}"
-    if validate_uint_between "$value" "$minimum" "$maximum"; then
-      printf -v "$variable_name" '%s' "$value"
+    printf '%s [%s]: ' "$prompt_choice_message" "$prompt_choice_default" > /dev/tty
+    IFS= read -r prompt_choice_input < /dev/tty
+    prompt_choice_input="${prompt_choice_input:-$prompt_choice_default}"
+    if validate_uint_between "$prompt_choice_input" "$prompt_choice_minimum" "$prompt_choice_maximum"; then
+      printf -v "$prompt_choice_variable_name" '%s' "$prompt_choice_input"
       return 0
     fi
-    printf '请输入 %s 到 %s 之间的数字。\n' "$minimum" "$maximum" > /dev/tty
+    printf '请输入 %s 到 %s 之间的数字。\n' "$prompt_choice_minimum" "$prompt_choice_maximum" > /dev/tty
   done
 }
 
 prompt_uint_range() {
-  local variable_name="$1"
-  local prompt="$2"
-  local default_value="$3"
-  local maximum="$4"
-  local value
+  local prompt_uint_variable_name="$1"
+  local prompt_uint_message="$2"
+  local prompt_uint_default="$3"
+  local prompt_uint_maximum="$4"
+  local prompt_uint_input
   require_tty
   while true; do
-    printf '%s [%s]: ' "$prompt" "$default_value" > /dev/tty
-    IFS= read -r value < /dev/tty
-    value="${value:-$default_value}"
-    if validate_uint_between "$value" 0 "$maximum"; then
-      printf -v "$variable_name" '%s' "$value"
+    printf '%s [%s]: ' "$prompt_uint_message" "$prompt_uint_default" > /dev/tty
+    IFS= read -r prompt_uint_input < /dev/tty
+    prompt_uint_input="${prompt_uint_input:-$prompt_uint_default}"
+    if validate_uint_between "$prompt_uint_input" 0 "$prompt_uint_maximum"; then
+      printf -v "$prompt_uint_variable_name" '%s' "$prompt_uint_input"
       return 0
     fi
-    printf '请输入 0 到 %s 之间的整数。\n' "$maximum" > /dev/tty
+    printf '请输入 0 到 %s 之间的整数。\n' "$prompt_uint_maximum" > /dev/tty
   done
 }
 
