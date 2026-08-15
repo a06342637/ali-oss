@@ -2,7 +2,7 @@
 
 专用于 [Dujiao-Next 官方 Docker Compose 部署](https://dujiao-next.com/deploy/docker-compose) 的交互式完整备份管理器。
 
-当前版本：`v1.1.4`
+当前版本：`v1.1.5`
 
 支持：
 
@@ -13,6 +13,7 @@
 - OSS 与 SFTP 双目标同时备份
 - 本地及远端按数量保留，自动删除最旧备份
 - systemd 间隔定时与宝塔计划任务
+- 统一配置中心，可逐项修改 OSS、SFTP、定时任务及其他参数
 - 菜单管理、连接测试、备份校验、在线升级和安全卸载
 
 ## 一键安装
@@ -134,8 +135,8 @@ dujiao-backup
 
 1. 立即执行完整备份
 2. 查看运行状态
-3. 配置部署、目标和保留数量
-4. 管理 systemd 定时
+3. 统一配置中心（部署、OSS、SFTP、定时等）
+4. 定时任务快捷管理
 5. 查看本地备份
 6. 查看远端备份
 7. 校验备份包
@@ -145,11 +146,26 @@ dujiao-backup
 11. 显示宝塔命令
 12. 安全卸载
 
+### 统一配置中心
+
+主菜单选择 `3` 后，可以安全查看脱敏配置，并分别修改：
+
+- Dujiao-Next 安装目录、SQLite/PostgreSQL 模式及 PostgreSQL 容器名
+- 本地和远端最多保留数量
+- OSS 启用状态、AccessKey、Region、Endpoint、Bucket、保存目录及版本控制策略
+- SFTP 启用状态、服务器、端口、用户名、远端目录、主机指纹及密钥认证
+- systemd 定时启停，以及天、小时、分钟间隔
+
+OSS 与 SFTP 可以独立启用或停用，修改其中一个不会自动关闭另一个。修改已启用的远端参数时，脚本会先完成连接和上传测试，测试失败不会覆盖原配置。
+
+SFTP 登录密码仍然不会保存；需要重新认证时只用于部署专用公钥。配置摘要不会显示 AccessKey Secret 等敏感值。
+
 常用非交互命令：
 
 ```bash
 dujiao-backup backup
 dujiao-backup status
+dujiao-backup configure
 dujiao-backup test
 dujiao-backup verify
 dujiao-backup logs

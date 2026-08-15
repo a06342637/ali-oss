@@ -119,4 +119,27 @@ while IFS= read -r local_name; do
   test "$local_sha" = "$remote_sha"
 done < <(find /opt/dujiao-backup/backups -maxdepth 1 -name 'dujiao-next-*.tar' -printf '%f\n' | sort)
 
+export PATH="$fake_bin:$PATH"
+printf '%s\n' \
+  5 \
+  6 \
+  '/config/dujiao-backups-menu' \
+  '' \
+  2 \
+  y \
+  '' \
+  1 \
+  '' \
+  0 \
+  0 | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" /dev/null
+(
+  # shellcheck disable=SC1091
+  source /opt/dujiao-backup/config.conf
+  test "$OSS_ENABLED" = "0"
+  test "$SFTP_ENABLED" = "1"
+  test "$SFTP_REMOTE_DIR" = "/config/dujiao-backups-menu"
+  test "$SFTP_KEY_FILE" = "/opt/dujiao-backup/keys/sftp_ed25519"
+  test "$SFTP_KNOWN_HOSTS" = "/opt/dujiao-backup/keys/known_hosts"
+)
+
 printf 'SFTP integration: OK\n'

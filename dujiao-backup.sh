@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROGRAM_NAME="Dujiao-Next Backup Manager"
-readonly VERSION="1.1.4"
+readonly VERSION="1.1.5"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -44,6 +44,7 @@ OSS_REGION=""
 OSS_ENDPOINT=""
 OSS_BUCKET=""
 OSS_PREFIX=""
+OSS_VERSIONING_ENABLED="0"
 OSS_DELETE_ALL_VERSIONS="0"
 SFTP_ENABLED="0"
 SFTP_HOST=""
@@ -309,6 +310,7 @@ set_config_defaults() {
   OSS_ENDPOINT=""
   OSS_BUCKET=""
   OSS_PREFIX=""
+  OSS_VERSIONING_ENABLED="0"
   OSS_DELETE_ALL_VERSIONS="0"
   SFTP_ENABLED="0"
   SFTP_HOST=""
@@ -336,6 +338,7 @@ load_config() {
   fi
   APP_DIR="$(normalize_absolute_path "$APP_DIR")"
   SFTP_REMOTE_DIR="$(normalize_absolute_path "$SFTP_REMOTE_DIR")"
+  [[ "$OSS_DELETE_ALL_VERSIONS" == "1" ]] && OSS_VERSIONING_ENABLED="1"
   # 密钥文件属于管理器内部状态，不接受配置文件改写到任意系统路径。
   SFTP_KEY_FILE="$KEY_DIR/sftp_ed25519"
   SFTP_KNOWN_HOSTS="$KEY_DIR/known_hosts"
@@ -370,6 +373,7 @@ save_config() {
     write_config_value OSS_ENDPOINT
     write_config_value OSS_BUCKET
     write_config_value OSS_PREFIX
+    write_config_value OSS_VERSIONING_ENABLED
     write_config_value OSS_DELETE_ALL_VERSIONS
     write_config_value SFTP_ENABLED
     write_config_value SFTP_HOST
@@ -413,7 +417,9 @@ validate_loaded_config() {
   fi
   [[ "$OSS_ENABLED" == "0" || "$OSS_ENABLED" == "1" ]] || die "OSS_ENABLED 配置无效。"
   [[ "$SFTP_ENABLED" == "0" || "$SFTP_ENABLED" == "1" ]] || die "SFTP_ENABLED 配置无效。"
+  [[ "$OSS_VERSIONING_ENABLED" == "0" || "$OSS_VERSIONING_ENABLED" == "1" ]] || die "OSS_VERSIONING_ENABLED 配置无效。"
   [[ "$OSS_DELETE_ALL_VERSIONS" == "0" || "$OSS_DELETE_ALL_VERSIONS" == "1" ]] || die "OSS_DELETE_ALL_VERSIONS 配置无效。"
+  [[ "$OSS_DELETE_ALL_VERSIONS" -eq 0 || "$OSS_VERSIONING_ENABLED" -eq 1 ]] || die "永久删除历史版本要求先启用 OSS 版本控制标记。"
   [[ "$TIMER_ENABLED" == "0" || "$TIMER_ENABLED" == "1" ]] || die "TIMER_ENABLED 配置无效。"
   validate_uint_between "$TIMER_DAYS" 0 3650 || die "TIMER_DAYS 配置无效。"
   validate_uint_between "$TIMER_HOURS" 0 23 || die "TIMER_HOURS 配置无效。"
@@ -451,7 +457,9 @@ validate_oss_settings() {
   [[ -n "$OSS_PREFIX" ]] || die "OSS 保存目录不能为空。"
   [[ "$OSS_PREFIX" != *".."* && "$OSS_PREFIX" != *"//"* ]] || die "OSS 保存目录不能含有 .. 或连续斜杠。"
   [[ "$OSS_PREFIX" != *[[:cntrl:]]* ]] || die "OSS 保存目录含有不可见控制字符。"
+  [[ "$OSS_VERSIONING_ENABLED" == "0" || "$OSS_VERSIONING_ENABLED" == "1" ]] || die "OSS 版本控制设置无效。"
   [[ "$OSS_DELETE_ALL_VERSIONS" == "0" || "$OSS_DELETE_ALL_VERSIONS" == "1" ]] || die "OSS 版本删除设置无效。"
+  [[ "$OSS_DELETE_ALL_VERSIONS" -eq 0 || "$OSS_VERSIONING_ENABLED" -eq 1 ]] || die "永久删除历史版本要求 Bucket 开启版本控制。"
 }
 
 validate_sftp_settings() {
@@ -614,15 +622,20 @@ install_ossutil() {
   success "ossutil $OSSUTIL_VERSION 安装完成。"
 }
 
-configure_oss_interactive() {
-  local value default_prefix versioning
-  heading "配置阿里云 OSS"
-  printf 'Region ID 可在阿里云 OSS 控制台 -> Bucket 概览/基本信息中查看。\n'
-  printf '示例：华东1（杭州）为 cn-hangzhou，Endpoint 为 oss-cn-hangzhou.aliyuncs.com。\n\n'
+prompt_oss_access_key_id() {
+  local value
   prompt_text value "AccessKey ID" "$OSS_ACCESS_KEY_ID" 1
   OSS_ACCESS_KEY_ID="$value"
+}
+
+prompt_oss_access_key_secret() {
+  local value
   prompt_secret value "AccessKey Secret（输入时不会显示）" "$OSS_ACCESS_KEY_SECRET"
   OSS_ACCESS_KEY_SECRET="$value"
+}
+
+prompt_oss_region() {
+  local value
   while true; do
     prompt_text value "Region ID，例如 cn-hangzhou" "$OSS_REGION" 1
     if [[ "$value" =~ ^[a-z0-9-]+$ ]]; then
@@ -631,6 +644,10 @@ configure_oss_interactive() {
     fi
     warn "Region ID 格式不正确。"
   done
+}
+
+prompt_oss_endpoint() {
+  local value
   [[ -n "$OSS_ENDPOINT" ]] || OSS_ENDPOINT="oss-$OSS_REGION.aliyuncs.com"
   while true; do
     prompt_text value "公网 Endpoint（不要写 https://）" "$OSS_ENDPOINT" 1
@@ -642,6 +659,10 @@ configure_oss_interactive() {
     fi
     warn "Endpoint 格式不正确。"
   done
+}
+
+prompt_oss_bucket() {
+  local value
   while true; do
     prompt_text value "Bucket 名称" "$OSS_BUCKET" 1
     if [[ "$value" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
@@ -650,6 +671,10 @@ configure_oss_interactive() {
     fi
     warn "Bucket 名称格式不正确。"
   done
+}
+
+prompt_oss_prefix() {
+  local value default_prefix
   default_prefix="${OSS_PREFIX:-dujiao-next/$(hostname -s)}"
   while true; do
     prompt_text value "OSS 内保存目录（可自定义）" "$default_prefix" 1
@@ -660,7 +685,12 @@ configure_oss_interactive() {
     fi
     warn "OSS 目录不能为空，也不能含有 ..、连续斜杠或控制字符。"
   done
-  prompt_yes_no versioning "这个 Bucket 是否开启了版本控制" 0
+}
+
+configure_oss_versioning_interactive() {
+  local versioning
+  prompt_yes_no versioning "这个 Bucket 是否开启了版本控制" "$OSS_VERSIONING_ENABLED"
+  OSS_VERSIONING_ENABLED="$versioning"
   if [[ "$versioning" -eq 1 ]]; then
     printf '普通删除只会生成 DeleteMarker，历史版本仍占用空间。\n'
     printf '如果不永久删除，请在 OSS 控制台配置“历史版本生命周期”。\n'
@@ -668,6 +698,19 @@ configure_oss_interactive() {
   else
     OSS_DELETE_ALL_VERSIONS="0"
   fi
+}
+
+configure_oss_interactive() {
+  heading "配置阿里云 OSS"
+  printf 'Region ID 可在阿里云 OSS 控制台 -> Bucket 概览/基本信息中查看。\n'
+  printf '示例：华东1（杭州）为 cn-hangzhou，Endpoint 为 oss-cn-hangzhou.aliyuncs.com。\n\n'
+  prompt_oss_access_key_id
+  prompt_oss_access_key_secret
+  prompt_oss_region
+  prompt_oss_endpoint
+  prompt_oss_bucket
+  prompt_oss_prefix
+  configure_oss_versioning_interactive
   validate_oss_settings
 }
 
@@ -748,25 +791,35 @@ setup_sftp_authentication() {
   success "SFTP 密钥登录与远端目录配置完成；登录密码未保存。"
 }
 
-configure_sftp_interactive() {
+prompt_sftp_host() {
   local value
-  heading "配置 SFTP/SSH 异地备份"
-  printf '首次配置需要远端 SSH 密码；脚本会下发专用密钥，之后不保存密码。\n'
   while true; do
     prompt_text value "远端服务器 IP 或域名" "$SFTP_HOST" 1
     if [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then SFTP_HOST="$value"; break; fi
     warn "主机格式不正确。"
   done
+}
+
+prompt_sftp_port() {
+  local value
   while true; do
     prompt_text value "SSH/SFTP 端口" "$SFTP_PORT" 1
     if validate_uint_between "$value" 1 65535; then SFTP_PORT="$value"; break; fi
     warn "端口必须为 1 到 65535。"
   done
+}
+
+prompt_sftp_user() {
+  local value
   while true; do
     prompt_text value "SSH 用户名" "$SFTP_USER" 1
     if [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; then SFTP_USER="$value"; break; fi
     warn "用户名格式不正确。"
   done
+}
+
+prompt_sftp_remote_dir() {
+  local value
   while true; do
     prompt_text value "远端保存目录（可自定义）" "$SFTP_REMOTE_DIR" 1
     value="$(normalize_absolute_path "$value")"
@@ -776,6 +829,15 @@ configure_sftp_interactive() {
     fi
     warn "请填写专用绝对路径，例如 /root/dujiao-backups，不能含空格或 ..。"
   done
+}
+
+configure_sftp_interactive() {
+  heading "配置 SFTP/SSH 异地备份"
+  printf '首次配置需要远端 SSH 密码；脚本会下发专用密钥，之后不保存密码。\n'
+  prompt_sftp_host
+  prompt_sftp_port
+  prompt_sftp_user
+  prompt_sftp_remote_dir
   validate_sftp_settings
   setup_sftp_authentication
 }
@@ -894,9 +956,9 @@ disable_timer() {
   success "脚本内置的 systemd 定时备份已停用。"
 }
 
-set_timer_interactive() {
+prompt_timer_interval_interactive() {
   local days hours minutes seconds
-  heading "设置定时备份"
+  heading "修改定时备份间隔"
   printf '三个数表示“间隔”，不是固定钟点；0 表示该项不参与。\n'
   printf '例如：0天 0小时 2分钟 = 每2分钟；1天 2小时 30分钟 = 每26小时30分钟。\n'
   printf '小时限定 0-23，分钟限定 0-59；三个数不能全部为 0。\n\n'
@@ -911,9 +973,36 @@ set_timer_interactive() {
     [[ "$seconds" -ge 60 ]] && break
     warn "三个数不能全部为 0，最短间隔为 1 分钟，请重新输入。"
   done
+}
+
+enable_timer_interactive() {
+  if [[ "$(timer_total_seconds)" -lt 60 ]]; then
+    warn "当前保存的间隔无效，请先重新设置。"
+    prompt_timer_interval_interactive
+  fi
   TIMER_ENABLED="1"
   activate_timer
   save_config
+}
+
+edit_timer_interval_interactive() {
+  local was_enabled="$TIMER_ENABLED"
+  prompt_timer_interval_interactive
+  if [[ "$was_enabled" -eq 1 ]]; then
+    TIMER_ENABLED="1"
+    activate_timer
+    save_config
+    success "定时间隔已修改并立即生效。"
+  else
+    TIMER_ENABLED="0"
+    save_config
+    success "定时间隔已保存；当前仍为停用状态。"
+  fi
+}
+
+set_timer_interactive() {
+  prompt_timer_interval_interactive
+  enable_timer_interactive
 }
 
 configure_timer_during_install() {
@@ -1551,7 +1640,9 @@ list_remote_backups() {
 
 mask_access_key() {
   local value="$1"
-  if [[ "${#value}" -le 8 ]]; then
+  if [[ -z "$value" ]]; then
+    printf '未设置'
+  elif [[ "${#value}" -le 8 ]]; then
     printf '****'
   else
     printf '%s****%s' "${value:0:4}" "${value: -4}"
@@ -1668,40 +1759,329 @@ run_child_command() {
   return 0
 }
 
+enabled_status_text() {
+  [[ "$1" == "1" ]] && printf '已启用' || printf '已停用'
+}
+
+secret_status_text() {
+  [[ -n "$1" ]] && printf '已保存（不显示）' || printf '未设置'
+}
+
+show_configuration_summary() {
+  local config_mode="未知"
+  [[ -f "$CONFIG_FILE" ]] && config_mode="$(stat -c '%U:%G %a' "$CONFIG_FILE" 2>/dev/null || printf '未知')"
+  heading "当前配置摘要（敏感信息已脱敏）"
+  printf '配置文件           : %s（%s）\n' "$CONFIG_FILE" "$config_mode"
+  printf 'Dujiao 目录        : %s\n' "$APP_DIR"
+  printf '部署模式           : %s\n' "$DEPLOY_MODE"
+  [[ "$DEPLOY_MODE" == "postgres" ]] && printf 'PostgreSQL 容器    : %s\n' "$PG_CONTAINER"
+  printf '最多保留           : %s 份\n' "$MAX_BACKUPS"
+  printf '\nOSS 状态           : %s\n' "$(enabled_status_text "$OSS_ENABLED")"
+  printf 'OSS AccessKey ID   : %s\n' "$(mask_access_key "$OSS_ACCESS_KEY_ID")"
+  printf 'OSS AccessKey 密钥 : %s\n' "$(secret_status_text "$OSS_ACCESS_KEY_SECRET")"
+  printf 'OSS Region         : %s\n' "${OSS_REGION:-未设置}"
+  printf 'OSS Endpoint       : %s\n' "${OSS_ENDPOINT:-未设置}"
+  printf 'OSS Bucket         : %s\n' "${OSS_BUCKET:-未设置}"
+  printf 'OSS 保存目录       : %s\n' "${OSS_PREFIX:-未设置}"
+  printf 'OSS 版本控制       : %s\n' "$(enabled_status_text "$OSS_VERSIONING_ENABLED")"
+  printf '删除全部历史版本   : %s\n' "$(enabled_status_text "$OSS_DELETE_ALL_VERSIONS")"
+  printf '\nSFTP 状态          : %s\n' "$(enabled_status_text "$SFTP_ENABLED")"
+  printf 'SFTP 主机          : %s\n' "${SFTP_HOST:-未设置}"
+  printf 'SFTP 端口          : %s\n' "$SFTP_PORT"
+  printf 'SFTP 用户          : %s\n' "$SFTP_USER"
+  printf 'SFTP 保存目录      : %s\n' "$SFTP_REMOTE_DIR"
+  printf 'SFTP 专用私钥      : %s\n' "$SFTP_KEY_FILE"
+  printf 'SFTP 公钥状态      : %s\n' "$([[ -f "$SFTP_KEY_FILE.pub" ]] && printf '已生成' || printf '未生成')"
+  printf '\n内置定时           : %s\n' "$(timer_status_text)"
+  printf '宝塔计划任务命令   : %s backup --scheduled\n' "$COMMAND_LINK"
+}
+
+oss_configuration_is_complete() {
+  (validate_oss_settings >/dev/null 2>&1)
+}
+
+persist_oss_parameter_change() {
+  local label="$1"
+  if [[ "$OSS_ENABLED" -eq 1 ]]; then
+    validate_oss_settings
+    install_ossutil
+    test_oss_connection
+  fi
+  save_config
+  if [[ "$OSS_ENABLED" -eq 1 ]]; then
+    success "$label 已保存，OSS 连接测试通过。"
+  else
+    success "$label 已保存；OSS 当前停用，启用时会进行完整连接测试。"
+  fi
+}
+
+enable_oss_target() {
+  if ! oss_configuration_is_complete; then
+    warn "OSS 参数尚不完整，请先完成一次完整配置。"
+    configure_oss_interactive
+  fi
+  validate_oss_settings
+  install_ossutil
+  test_oss_connection
+  OSS_ENABLED="1"
+  save_config
+  success "阿里云 OSS 备份已启用。"
+}
+
+disable_oss_target() {
+  local confirmed
+  if [[ "$OSS_ENABLED" -eq 0 ]]; then
+    info "OSS 已经处于停用状态。"
+    return 0
+  fi
+  warn "停用后不会删除 OSS 中已有备份，但新备份不再上传到 OSS。"
+  prompt_yes_no confirmed "确认停用 OSS 备份" 0
+  [[ "$confirmed" -eq 1 ]] || { info "已取消。"; return 0; }
+  OSS_ENABLED="0"
+  save_config
+  success "阿里云 OSS 备份已停用。"
+}
+
+configure_all_oss_parameters() {
+  local enable_now="$OSS_ENABLED"
+  configure_oss_interactive
+  install_ossutil
+  test_oss_connection
+  if [[ "$OSS_ENABLED" -eq 0 ]]; then
+    prompt_yes_no enable_now "OSS 配置测试通过，是否立即启用" 1
+  fi
+  OSS_ENABLED="$enable_now"
+  save_config
+  success "OSS 全部参数已保存。"
+}
+
+oss_configuration_menu() {
+  local choice
+  while true; do
+    load_config || die "尚未安装。"
+    heading "阿里云 OSS 配置"
+    printf '当前状态：%s\n' "$(enabled_status_text "$OSS_ENABLED")"
+    printf '当前位置：oss://%s/%s\n\n' "${OSS_BUCKET:-未设置}" "${OSS_PREFIX:-未设置}"
+    printf '  1) 启用 OSS 备份\n'
+    printf '  2) 停用 OSS 备份\n'
+    printf '  3) 修改 AccessKey ID\n'
+    printf '  4) 修改 AccessKey Secret\n'
+    printf '  5) 修改 Region ID\n'
+    printf '  6) 修改 Endpoint\n'
+    printf '  7) 修改 Bucket 名称\n'
+    printf '  8) 修改 OSS 保存目录\n'
+    printf '  9) 修改版本控制/历史版本删除策略\n'
+    printf ' 10) 重新配置全部 OSS 参数\n'
+    printf ' 11) 测试 OSS 连接\n'
+    printf '  0) 返回统一配置中心\n'
+    prompt_choice choice "请选择" 0 11 0
+    case "$choice" in
+      1) enable_oss_target ;;
+      2) disable_oss_target ;;
+      3) prompt_oss_access_key_id; persist_oss_parameter_change "AccessKey ID" ;;
+      4) prompt_oss_access_key_secret; persist_oss_parameter_change "AccessKey Secret" ;;
+      5) prompt_oss_region; persist_oss_parameter_change "Region ID" ;;
+      6) prompt_oss_endpoint; persist_oss_parameter_change "Endpoint" ;;
+      7)
+        prompt_oss_bucket
+        persist_oss_parameter_change "Bucket"
+        warn "Bucket 改变后，下次备份会把本地保留备份同步到新目标。"
+        ;;
+      8)
+        prompt_oss_prefix
+        persist_oss_parameter_change "OSS 保存目录"
+        warn "保存目录改变后，下次备份会把本地保留备份同步到新目录。"
+        ;;
+      9) configure_oss_versioning_interactive; persist_oss_parameter_change "OSS 版本策略" ;;
+      10) configure_all_oss_parameters ;;
+      11)
+        validate_oss_settings
+        install_ossutil
+        test_oss_connection
+        ;;
+      0) return 0 ;;
+    esac
+    pause_for_enter
+  done
+}
+
+sftp_configuration_is_complete() {
+  (validate_sftp_settings >/dev/null 2>&1)
+}
+
+prepare_sftp_target() {
+  validate_sftp_settings
+  ensure_sftp_key
+  if sftp_ssh "true" >/dev/null 2>&1; then
+    CURRENT_STEP="创建 SFTP 远端备份目录"
+    sftp_ssh "umask 077; mkdir -p -- '$SFTP_REMOTE_DIR'; chmod 700 -- '$SFTP_REMOTE_DIR'"
+  else
+    setup_sftp_authentication
+  fi
+}
+
+persist_sftp_parameter_change() {
+  local label="$1"
+  if [[ "$SFTP_ENABLED" -eq 1 ]]; then
+    prepare_sftp_target
+    test_sftp_connection
+  fi
+  save_config
+  if [[ "$SFTP_ENABLED" -eq 1 ]]; then
+    success "$label 已保存，SFTP 登录和上传测试通过。"
+  else
+    success "$label 已保存；SFTP 当前停用，启用时会完成认证和测试。"
+  fi
+}
+
+enable_sftp_target() {
+  if ! sftp_configuration_is_complete; then
+    warn "SFTP 参数尚不完整，请先完成一次完整配置。"
+    configure_sftp_interactive
+  else
+    prepare_sftp_target
+  fi
+  test_sftp_connection
+  SFTP_ENABLED="1"
+  save_config
+  success "SFTP 异地备份已启用。"
+}
+
+disable_sftp_target() {
+  local confirmed
+  if [[ "$SFTP_ENABLED" -eq 0 ]]; then
+    info "SFTP 已经处于停用状态。"
+    return 0
+  fi
+  warn "停用后不会删除远端已有备份，但新备份不再上传到 SFTP。"
+  prompt_yes_no confirmed "确认停用 SFTP 备份" 0
+  [[ "$confirmed" -eq 1 ]] || { info "已取消。"; return 0; }
+  SFTP_ENABLED="0"
+  save_config
+  success "SFTP 异地备份已停用。"
+}
+
+configure_all_sftp_parameters() {
+  local enable_now="$SFTP_ENABLED"
+  configure_sftp_interactive
+  test_sftp_connection
+  if [[ "$SFTP_ENABLED" -eq 0 ]]; then
+    prompt_yes_no enable_now "SFTP 配置测试通过，是否立即启用" 1
+  fi
+  SFTP_ENABLED="$enable_now"
+  save_config
+  success "SFTP 全部参数已保存。"
+}
+
+show_sftp_public_key() {
+  ensure_sftp_key
+  heading "SFTP 专用公钥（可手工加入远端 authorized_keys）"
+  cat "$SFTP_KEY_FILE.pub"
+}
+
+sftp_configuration_menu() {
+  local choice
+  while true; do
+    load_config || die "尚未安装。"
+    heading "SFTP/SSH 异地备份配置"
+    printf '当前状态：%s\n' "$(enabled_status_text "$SFTP_ENABLED")"
+    printf '当前目标：%s@%s:%s%s\n\n' "$SFTP_USER" "${SFTP_HOST:-未设置}" "$SFTP_PORT" "$SFTP_REMOTE_DIR"
+    printf '  1) 启用 SFTP 备份\n'
+    printf '  2) 停用 SFTP 备份\n'
+    printf '  3) 修改服务器 IP/域名\n'
+    printf '  4) 修改 SSH 端口\n'
+    printf '  5) 修改 SSH 用户名\n'
+    printf '  6) 修改远端保存目录\n'
+    printf '  7) 重新建立密钥认证/更新主机指纹\n'
+    printf '  8) 重新配置全部 SFTP 参数\n'
+    printf '  9) 测试 SFTP 连接与上传\n'
+    printf ' 10) 显示 SFTP 专用公钥\n'
+    printf '  0) 返回统一配置中心\n'
+    prompt_choice choice "请选择" 0 10 0
+    case "$choice" in
+      1) enable_sftp_target ;;
+      2) disable_sftp_target ;;
+      3) prompt_sftp_host; persist_sftp_parameter_change "SFTP 主机" ;;
+      4) prompt_sftp_port; persist_sftp_parameter_change "SFTP 端口" ;;
+      5) prompt_sftp_user; persist_sftp_parameter_change "SFTP 用户名" ;;
+      6)
+        prompt_sftp_remote_dir
+        persist_sftp_parameter_change "SFTP 保存目录"
+        warn "保存目录改变后，下次备份会把本地保留备份同步到新目录。"
+        ;;
+      7)
+        validate_sftp_settings
+        setup_sftp_authentication
+        test_sftp_connection
+        save_config
+        success "SFTP 密钥认证和主机指纹已更新。"
+        ;;
+      8) configure_all_sftp_parameters ;;
+      9)
+        validate_sftp_settings
+        test_sftp_connection
+        ;;
+      10) show_sftp_public_key ;;
+      0) return 0 ;;
+    esac
+    pause_for_enter
+  done
+}
+
+complete_configuration_wizard() {
+  local change_timer timer_enabled
+  choose_deployment_interactive
+  configure_retention_interactive
+  configure_targets_interactive
+  save_config
+  test_targets_command
+  prompt_yes_no change_timer "是否同时修改内置定时任务" 1
+  if [[ "$change_timer" -eq 1 ]]; then
+    prompt_yes_no timer_enabled "是否启用内置 systemd 定时备份" "$TIMER_ENABLED"
+    if [[ "$timer_enabled" -eq 1 ]]; then
+      set_timer_interactive
+    else
+      disable_timer
+    fi
+  fi
+  success "完整配置向导已完成。"
+}
+
 configuration_menu() {
   local choice
   while true; do
     load_config || die "尚未安装。"
-    heading "配置管理"
-    printf '  1) 重新识别/选择 Dujiao 部署模式\n'
-    printf '  2) 配置或切换 OSS/SFTP 目标\n'
-    printf '  3) 修改保留数量\n'
-    printf '  4) 完整配置向导\n'
-    printf '  0) 返回\n'
-    prompt_choice choice "请选择" 0 4 0
+    heading "统一配置中心"
+    printf '部署：%s  |  保留：%s份  |  OSS：%s  |  SFTP：%s  |  定时：%s\n\n' \
+      "$DEPLOY_MODE" "$MAX_BACKUPS" "$(enabled_status_text "$OSS_ENABLED")" \
+      "$(enabled_status_text "$SFTP_ENABLED")" "$(timer_status_text)"
+    printf '  1) 查看全部配置摘要（脱敏）\n'
+    printf '  2) 修改 Dujiao 部署目录/模式\n'
+    printf '  3) 修改备份保留数量\n'
+    printf '  4) 管理阿里云 OSS 全部参数\n'
+    printf '  5) 管理 SFTP/SSH 全部参数\n'
+    printf '  6) 管理定时任务全部参数\n'
+    printf '  7) 重新运行完整配置向导\n'
+    printf '  8) 测试当前已启用的远端目标\n'
+    printf '  0) 返回主菜单\n'
+    prompt_choice choice "请选择" 0 8 0
     case "$choice" in
-      1)
+      1) show_configuration_summary ;;
+      2)
         choose_deployment_interactive
         save_config
         success "部署配置已保存。"
-        ;;
-      2)
-        configure_targets_interactive
-        save_config
-        test_targets_command
         ;;
       3)
         configure_retention_interactive
         save_config
         success "保留数量已保存。"
         ;;
-      4)
-        choose_deployment_interactive
-        configure_retention_interactive
-        configure_targets_interactive
-        save_config
-        test_targets_command
-        ;;
+      4) oss_configuration_menu; continue ;;
+      5) sftp_configuration_menu; continue ;;
+      6) timer_menu; continue ;;
+      7) complete_configuration_wizard ;;
+      8) test_targets_command ;;
       0) return 0 ;;
     esac
     pause_for_enter
@@ -1713,17 +2093,20 @@ timer_menu() {
   while true; do
     load_config || die "尚未安装。"
     heading "定时任务管理"
-    printf '当前状态：%s\n\n' "$(timer_status_text)"
-    printf '  1) 启用或修改执行间隔\n'
-    printf '  2) 停用内置 systemd 定时\n'
-    printf '  3) 查看 systemd 定时器状态\n'
-    printf '  4) 显示宝塔计划任务命令\n'
+    printf '当前状态：%s\n' "$(timer_status_text)"
+    printf '已保存间隔：%s\n\n' "$(format_interval)"
+    printf '  1) 使用当前间隔启用/重新启动定时\n'
+    printf '  2) 修改天、小时、分钟间隔\n'
+    printf '  3) 停用内置 systemd 定时\n'
+    printf '  4) 查看 systemd 定时器状态\n'
+    printf '  5) 显示宝塔计划任务命令\n'
     printf '  0) 返回\n'
-    prompt_choice choice "请选择" 0 4 0
+    prompt_choice choice "请选择" 0 5 0
     case "$choice" in
-      1) set_timer_interactive ;;
-      2) disable_timer ;;
-      3)
+      1) enable_timer_interactive ;;
+      2) edit_timer_interval_interactive ;;
+      3) disable_timer ;;
+      4)
         if systemd_available; then
           systemctl status dujiao-backup.timer --no-pager || true
           systemctl list-timers dujiao-backup.timer --no-pager || true
@@ -1731,7 +2114,7 @@ timer_menu() {
           warn "当前系统没有运行 systemd。"
         fi
         ;;
-      4) show_baota_command ;;
+      5) show_baota_command ;;
       0) return 0 ;;
     esac
     pause_for_enter
@@ -1779,8 +2162,8 @@ menu() {
     heading "$PROGRAM_NAME v$VERSION"
     printf '  1) 立即执行完整备份\n'
     printf '  2) 查看运行状态\n'
-    printf '  3) 配置部署/目标/保留数量\n'
-    printf '  4) 定时任务管理\n'
+    printf '  3) 统一配置中心（部署/OSS/SFTP/定时等）\n'
+    printf '  4) 定时任务快捷管理\n'
     printf '  5) 查看本地备份\n'
     printf '  6) 查看远端备份\n'
     printf '  7) 校验备份包\n'
@@ -1950,6 +2333,7 @@ $PROGRAM_NAME v$VERSION
   dujiao-backup                    打开管理菜单
   dujiao-backup backup             立即完整备份
   dujiao-backup status             查看状态
+  dujiao-backup configure          打开统一配置中心
   dujiao-backup test               测试远端目标
   dujiao-backup verify [文件]      校验备份包
   dujiao-backup update             在线升级

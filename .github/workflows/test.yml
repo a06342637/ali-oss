@@ -21,7 +21,7 @@ jobs:
       - name: Built-in self test
         run: bash dujiao-backup.sh self-test
       - name: Version contract
-        run: test "$(bash dujiao-backup.sh version)" = "1.1.4"
+        run: test "$(bash dujiao-backup.sh version)" = "1.1.5"
 
   debian:
     runs-on: ubuntu-latest
@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install SQLite
-        run: sudo apt-get update && sudo apt-get install -y sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 util-linux
       - name: Create a complete SQLite backup and enforce retention
         run: |
           set -Eeuo pipefail
@@ -175,7 +175,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install SQLite
-        run: sudo apt-get update && sudo apt-get install -y sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 util-linux
       - name: Test OSS upload verification, repair and retention
         run: sudo env DUJIAO_INTEGRATION_TEST=1 bash tests/integration-oss.sh
 
@@ -184,7 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y sqlite3 sshpass
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 sshpass util-linux
       - name: Test SFTP upload verification, repair and retention
         run: |
           set -Eeuo pipefail

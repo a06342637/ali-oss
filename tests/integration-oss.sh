@@ -47,7 +47,7 @@ printf '%s\n' \
   'OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com' \
   'OSS_BUCKET=test-bucket' \
   'OSS_PREFIX=dujiao-next/test-host' \
-  'OSS_DELETE_ALL_VERSIONS=0' \
+  'OSS_DELETE_ALL_VERSIONS=1' \
   'SFTP_ENABLED=0' > "$config_tmp"
 install -m 0600 "$config_tmp" /opt/dujiao-backup/config.conf
 
@@ -81,6 +81,45 @@ while IFS= read -r local_name; do
   test "$(sha256sum "/opt/dujiao-backup/backups/$local_name" | awk '{print $1}')" \
     = "$(< "$remote_dir/$local_name.dujiao-sha256")"
 done < <(find /opt/dujiao-backup/backups -maxdepth 1 -name 'dujiao-next-*.tar' -printf '%f\n' | sort)
+
+export PATH="$fake_bin:$PATH"
+export FAKE_OSS_ROOT="$remote_root"
+printf '%s\n' \
+  4 \
+  8 \
+  'dujiao-next/menu-host' \
+  '' \
+  2 \
+  y \
+  '' \
+  1 \
+  '' \
+  0 \
+  3 \
+  3 \
+  '' \
+  6 \
+  2 \
+  0 \
+  1 \
+  15 \
+  '' \
+  0 \
+  0 | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" /dev/null
+(
+  # shellcheck disable=SC1091
+  source /opt/dujiao-backup/config.conf
+  test "$OSS_ENABLED" = "1"
+  test "$SFTP_ENABLED" = "0"
+  test "$OSS_PREFIX" = "dujiao-next/menu-host"
+  test "$OSS_VERSIONING_ENABLED" = "1"
+  test "$OSS_DELETE_ALL_VERSIONS" = "1"
+  test "$MAX_BACKUPS" = "3"
+  test "$TIMER_ENABLED" = "0"
+  test "$TIMER_DAYS" = "0"
+  test "$TIMER_HOURS" = "1"
+  test "$TIMER_MINUTES" = "15"
+)
 
 cp /opt/dujiao-backup/config.conf /tmp/dujiao-backup-config-good
 printf 'TIMER_HOURS=08\n' >> /opt/dujiao-backup/config.conf
