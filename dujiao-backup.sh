@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROGRAM_NAME="Dujiao-Next Backup Manager"
-readonly VERSION="1.1.3"
+readonly VERSION="1.1.4"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -20,6 +20,8 @@ readonly COMMAND_LINK="/usr/local/bin/dujiao-backup"
 readonly SERVICE_FILE="/etc/systemd/system/dujiao-backup.service"
 readonly TIMER_FILE="/etc/systemd/system/dujiao-backup.timer"
 readonly OSSUTIL_VERSION="2.3.0"
+readonly LOG_MAX_BYTES="10485760"
+readonly LOG_ROTATIONS="5"
 
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 CURRENT_STEP="启动程序"
@@ -59,7 +61,8 @@ now() { date --iso-8601=seconds; }
 
 write_log_only() {
   local line="$1"
-  if [[ "$LOG_CAPTURED" -eq 0 && -d "$LOG_DIR" ]]; then
+  if [[ "$LOG_CAPTURED" -eq 0 && -d "$LOG_DIR" && ! -L "$LOG_DIR" \
+    && -f "$LOG_FILE" && ! -L "$LOG_FILE" ]]; then
     printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || true
   fi
 }
@@ -130,15 +133,39 @@ require_tty() {
 }
 
 ensure_runtime_dirs() {
+  local path
+  for path in "$INSTALL_DIR" "$LOG_DIR" "$BACKUP_DIR" "$KEY_DIR" "$STATE_DIR" "$TMP_DIR"; do
+    [[ ! -L "$path" ]] || die "运行目录不能是符号链接：$path"
+  done
   install -d -o root -g root -m 0700 \
     "$INSTALL_DIR" "$LOG_DIR" "$BACKUP_DIR" "$KEY_DIR" "$STATE_DIR" "$TMP_DIR"
+  [[ ! -L "$LOG_FILE" ]] || die "日志文件不能是符号链接：$LOG_FILE"
   touch "$LOG_FILE"
+  chown root:root "$LOG_FILE"
+  chmod 0600 "$LOG_FILE"
+}
+
+rotate_logs_if_needed() {
+  local size index
+  [[ -f "$LOG_FILE" ]] || return 0
+  size="$(stat -c %s "$LOG_FILE")"
+  [[ "$size" -ge "$LOG_MAX_BYTES" ]] || return 0
+  rm -f -- "$LOG_FILE.$LOG_ROTATIONS"
+  for ((index = LOG_ROTATIONS - 1; index >= 1; index--)); do
+    if [[ -f "$LOG_FILE.$index" ]]; then
+      mv -f -- "$LOG_FILE.$index" "$LOG_FILE.$((index + 1))"
+    fi
+  done
+  mv -f -- "$LOG_FILE" "$LOG_FILE.1"
+  touch "$LOG_FILE"
+  chown root:root "$LOG_FILE"
   chmod 0600 "$LOG_FILE"
 }
 
 start_log_capture() {
   ensure_runtime_dirs
   if [[ "$LOG_CAPTURED" -eq 0 ]]; then
+    rotate_logs_if_needed
     exec > >(tee -a "$LOG_FILE") 2>&1
     LOG_CAPTURED=1
   fi
@@ -240,7 +267,7 @@ prompt_choice() {
     printf '%s [%s]: ' "$prompt" "$default_value" > /dev/tty
     IFS= read -r value < /dev/tty
     value="${value:-$default_value}"
-    if [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$minimum" && "$value" -le "$maximum" ]]; then
+    if validate_uint_between "$value" "$minimum" "$maximum"; then
       printf -v "$variable_name" '%s' "$value"
       return 0
     fi
@@ -259,7 +286,7 @@ prompt_uint_range() {
     printf '%s [%s]: ' "$prompt" "$default_value" > /dev/tty
     IFS= read -r value < /dev/tty
     value="${value:-$default_value}"
-    if [[ "$value" =~ ^[0-9]+$ && "$value" -le "$maximum" ]]; then
+    if validate_uint_between "$value" 0 "$maximum"; then
       printf -v "$variable_name" '%s' "$value"
       return 0
     fi
@@ -298,9 +325,22 @@ set_config_defaults() {
 
 load_config() {
   set_config_defaults
-  [[ -r "$CONFIG_FILE" ]] || return 1
+  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" && -r "$CONFIG_FILE" ]] || return 1
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown root:root "$CONFIG_FILE"
+    chmod 0600 "$CONFIG_FILE"
+  fi
   # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
+  if ! source "$CONFIG_FILE"; then
+    return 1
+  fi
+  APP_DIR="$(normalize_absolute_path "$APP_DIR")"
+  SFTP_REMOTE_DIR="$(normalize_absolute_path "$SFTP_REMOTE_DIR")"
+  # 密钥文件属于管理器内部状态，不接受配置文件改写到任意系统路径。
+  SFTP_KEY_FILE="$KEY_DIR/sftp_ed25519"
+  SFTP_KNOWN_HOSTS="$KEY_DIR/known_hosts"
+  validate_loaded_config
+  set_deployment_paths
 }
 
 write_config_value() {
@@ -352,18 +392,53 @@ is_safe_absolute_path() {
   local path="$1"
   [[ "$path" == /* ]] || return 1
   [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
-  [[ "$path" != "/" && "$path" != *"/../"* && "$path" != *"/.." && "$path" != *"//"* ]]
+  [[ "$path" != "/" && "$path" != *"/../"* && "$path" != *"/.." \
+    && "$path" != *"/./"* && "$path" != *"/." && "$path" != *"//"* ]]
 }
 
-validate_positive_integer() {
-  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+validate_uint_between() {
+  local value="$1"
+  local minimum="$2"
+  local maximum="$3"
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ && "${#value}" -le 10 ]] || return 1
+  (( value >= minimum && value <= maximum ))
+}
+
+validate_loaded_config() {
+  [[ "$CONFIG_VERSION" == "1" ]] || die "CONFIG_VERSION 配置无效。"
+  is_safe_absolute_path "$APP_DIR" || die "APP_DIR 必须是安全的绝对路径。"
+  [[ "$PG_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "PG_CONTAINER 配置无效。"
+  if ! validate_uint_between "$MAX_BACKUPS" 1 10000; then
+    die "MAX_BACKUPS 必须是 1 到 10000。"
+  fi
+  [[ "$OSS_ENABLED" == "0" || "$OSS_ENABLED" == "1" ]] || die "OSS_ENABLED 配置无效。"
+  [[ "$SFTP_ENABLED" == "0" || "$SFTP_ENABLED" == "1" ]] || die "SFTP_ENABLED 配置无效。"
+  [[ "$OSS_DELETE_ALL_VERSIONS" == "0" || "$OSS_DELETE_ALL_VERSIONS" == "1" ]] || die "OSS_DELETE_ALL_VERSIONS 配置无效。"
+  [[ "$TIMER_ENABLED" == "0" || "$TIMER_ENABLED" == "1" ]] || die "TIMER_ENABLED 配置无效。"
+  validate_uint_between "$TIMER_DAYS" 0 3650 || die "TIMER_DAYS 配置无效。"
+  validate_uint_between "$TIMER_HOURS" 0 23 || die "TIMER_HOURS 配置无效。"
+  validate_uint_between "$TIMER_MINUTES" 0 59 || die "TIMER_MINUTES 配置无效。"
+  validate_uint_between "$SFTP_PORT" 1 65535 || die "SFTP_PORT 配置无效。"
+  case "$DEPLOY_MODE" in
+    sqlite|postgres) ;;
+    *) die "DEPLOY_MODE 配置必须是 sqlite 或 postgres。" ;;
+  esac
+  if [[ "$TIMER_ENABLED" -eq 1 ]]; then
+    [[ "$((TIMER_DAYS * 86400 + TIMER_HOURS * 3600 + TIMER_MINUTES * 60))" -ge 60 ]] || die "启用定时时，间隔不能全部为 0。"
+  fi
 }
 
 normalize_oss_prefix() {
   local prefix="$1"
-  prefix="${prefix#/}"
-  prefix="${prefix%/}"
+  while [[ "$prefix" == /* ]]; do prefix="${prefix#/}"; done
+  while [[ "$prefix" == */ ]]; do prefix="${prefix%/}"; done
   printf '%s' "$prefix"
+}
+
+normalize_absolute_path() {
+  local path="$1"
+  while [[ "$path" != "/" && "$path" == */ ]]; do path="${path%/}"; done
+  printf '%s' "$path"
 }
 
 validate_oss_settings() {
@@ -381,7 +456,7 @@ validate_oss_settings() {
 
 validate_sftp_settings() {
   [[ "$SFTP_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || die "SFTP 主机只能填写 IPv4 地址或普通域名。"
-  [[ "$SFTP_PORT" =~ ^[0-9]+$ && "$SFTP_PORT" -ge 1 && "$SFTP_PORT" -le 65535 ]] || die "SFTP 端口必须为 1 到 65535。"
+  validate_uint_between "$SFTP_PORT" 1 65535 || die "SFTP 端口必须为 1 到 65535。"
   [[ "$SFTP_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]] || die "SFTP 用户名格式不正确。"
   is_safe_absolute_path "$SFTP_REMOTE_DIR" || die "SFTP 远端目录必须是安全的绝对路径，不能含空格或 ..。"
   [[ "$SFTP_REMOTE_DIR" != "/root" && "$SFTP_REMOTE_DIR" != "/home" ]] || die "SFTP 远端目录范围过大，请填写专用子目录。"
@@ -465,6 +540,7 @@ choose_deployment_interactive() {
   local input_dir detected choice container_name
   heading "识别 Dujiao-Next 部署方式"
   prompt_text input_dir "Dujiao-Next 安装目录" "$APP_DIR" 1
+  input_dir="$(normalize_absolute_path "$input_dir")"
   is_safe_absolute_path "$input_dir" || die "安装目录只能使用不含空格和 .. 的绝对路径。"
   APP_DIR="$input_dir"
   if detected="$(detect_deployment_mode "$APP_DIR")"; then
@@ -599,12 +675,19 @@ ensure_sftp_key() {
   install -d -o root -g root -m 0700 "$KEY_DIR"
   if [[ ! -f "$SFTP_KEY_FILE" ]]; then
     CURRENT_STEP="生成 SFTP 专用 SSH 密钥"
+    rm -f -- "$SFTP_KEY_FILE.pub"
     ssh-keygen -q -t ed25519 -N '' -C "dujiao-backup@$(hostname -s)" -f "$SFTP_KEY_FILE"
-    chmod 0600 "$SFTP_KEY_FILE"
-    chmod 0644 "$SFTP_KEY_FILE.pub"
     success "已生成 SFTP 专用密钥：$SFTP_KEY_FILE"
+  elif [[ ! -f "$SFTP_KEY_FILE.pub" ]]; then
+    CURRENT_STEP="从 SFTP 私钥恢复公钥"
+    ssh-keygen -y -f "$SFTP_KEY_FILE" > "$SFTP_KEY_FILE.pub"
+    success "SFTP 公钥缺失，已从现有私钥安全恢复。"
   fi
+  chown root:root "$SFTP_KEY_FILE" "$SFTP_KEY_FILE.pub"
+  chmod 0600 "$SFTP_KEY_FILE"
+  chmod 0644 "$SFTP_KEY_FILE.pub"
   touch "$SFTP_KNOWN_HOSTS"
+  chown root:root "$SFTP_KNOWN_HOSTS"
   chmod 0600 "$SFTP_KNOWN_HOSTS"
 }
 
@@ -676,7 +759,7 @@ configure_sftp_interactive() {
   done
   while true; do
     prompt_text value "SSH/SFTP 端口" "$SFTP_PORT" 1
-    if [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le 65535 ]]; then SFTP_PORT="$value"; break; fi
+    if validate_uint_between "$value" 1 65535; then SFTP_PORT="$value"; break; fi
     warn "端口必须为 1 到 65535。"
   done
   while true; do
@@ -686,6 +769,7 @@ configure_sftp_interactive() {
   done
   while true; do
     prompt_text value "远端保存目录（可自定义）" "$SFTP_REMOTE_DIR" 1
+    value="$(normalize_absolute_path "$value")"
     if is_safe_absolute_path "$value" && [[ "$value" != "/root" && "$value" != "/home" ]]; then
       SFTP_REMOTE_DIR="$value"
       break
@@ -732,7 +816,7 @@ configure_retention_interactive() {
   heading "设置备份保留数量"
   while true; do
     prompt_text value "本地及已启用远端最多保留多少个完整备份" "$MAX_BACKUPS" 1
-    if validate_positive_integer "$value" && [[ "$value" -le 10000 ]]; then
+    if validate_uint_between "$value" 1 10000; then
       MAX_BACKUPS="$value"
       break
     fi
@@ -795,7 +879,8 @@ activate_timer() {
   systemd_available || die "当前系统没有运行 systemd；可改用宝塔计划任务。"
   write_systemd_units
   systemctl daemon-reload
-  systemctl enable --now dujiao-backup.timer
+  systemctl enable dujiao-backup.timer
+  systemctl restart dujiao-backup.timer
   success "定时备份已启用：每 $(format_interval) 执行一次（上一轮结束后重新计时）。"
 }
 
@@ -827,8 +912,8 @@ set_timer_interactive() {
     warn "三个数不能全部为 0，最短间隔为 1 分钟，请重新输入。"
   done
   TIMER_ENABLED="1"
-  save_config
   activate_timer
+  save_config
 }
 
 configure_timer_during_install() {
@@ -860,6 +945,27 @@ sftp_destination_id() {
   printf 'sftp://%s@%s:%s%s' "$SFTP_USER" "$SFTP_HOST" "$SFTP_PORT" "$SFTP_REMOTE_DIR"
 }
 
+json_string_field() {
+  local field="$1"
+  awk -F'"' -v key="$field" '$2 == key {print $4; exit}'
+}
+
+oss_upload_and_verify() {
+  local local_file="$1"
+  local uri="$2"
+  local local_size local_sha stat_json remote_size remote_sha
+  local_size="$(stat -c %s "$local_file")"
+  local_sha="$(sha256sum "$local_file" | awk '{print $1}')"
+  # 不使用 ossutil --checksum：该选项会跳过同内容对象，无法为旧对象补写校验元数据。
+  ossutil cp "$local_file" "$uri" -f --no-progress \
+    --metadata "dujiao-sha256=$local_sha"
+  stat_json="$(ossutil stat "$uri" --output-format json)"
+  remote_size="$(printf '%s\n' "$stat_json" | json_string_field 'Content-Length')"
+  remote_sha="$(printf '%s\n' "$stat_json" | json_string_field 'X-Oss-Meta-Dujiao-Sha256')"
+  [[ "$remote_size" == "$local_size" ]] || die "OSS 上传后大小不一致：本地 $local_size，远端 ${remote_size:-未知}。"
+  [[ "$remote_sha" == "$local_sha" ]] || die "OSS 上传后 SHA256 元数据校验失败。"
+}
+
 test_oss_connection() {
   local probe name uri
   validate_oss_settings
@@ -868,12 +974,15 @@ test_oss_connection() {
   probe="$(mktemp "$TMP_DIR/oss-test.XXXXXX")"
   register_temp "$probe"
   printf 'Dujiao backup connection test: %s\n' "$(now)" > "$probe"
-  name=".dujiao-backup-test-$(hostname -s)-$$"
+  name=".dujiao-backup-connection-test"
   uri="$(oss_destination_id)/$name"
   CURRENT_STEP="测试 OSS 上传"
-  ossutil cp "$probe" "$uri" -f --no-progress
-  ossutil stat "$uri" >/dev/null
-  ossutil rm "$uri" -f
+  oss_upload_and_verify "$probe" "$uri"
+  if [[ "$OSS_DELETE_ALL_VERSIONS" -eq 1 ]]; then
+    ossutil rm "$uri" -f --all-versions
+  else
+    ossutil rm "$uri" -f
+  fi
   success "OSS 连接、上传、校验和删除测试通过：$(oss_destination_id)/"
 }
 
@@ -1043,8 +1152,7 @@ sync_archive_to_oss() {
   CURRENT_STEP="上传 $name 到阿里云 OSS"
   uri="$(oss_archive_uri "$name")"
   info "正在上传到 OSS：$uri"
-  ossutil cp "$archive" "$uri" -f --no-progress
-  ossutil stat "$uri" >/dev/null
+  oss_upload_and_verify "$archive" "$uri"
   write_marker "$marker" "$destination"
   success "OSS 上传并校验成功：$uri"
 }
@@ -1082,6 +1190,8 @@ sync_all_archives() {
   if [[ "$SFTP_ENABLED" -eq 1 ]]; then
     validate_sftp_settings
     [[ -f "$SFTP_KEY_FILE" && -f "$SFTP_KNOWN_HOSTS" ]] || die "SFTP 密钥或主机指纹文件缺失，请重新配置。"
+    chown root:root "$SFTP_KEY_FILE" "$SFTP_KNOWN_HOSTS"
+    chmod 0600 "$SFTP_KEY_FILE" "$SFTP_KNOWN_HOSTS"
   fi
   for archive in "${archives[@]}"; do
     name="$(basename "$archive")"
@@ -1115,6 +1225,16 @@ parse_archive_names() {
   grep -oE 'dujiao-next-[0-9]{8}-[0-9]{6}[.]tar$' | sort -u || true
 }
 
+archive_array_contains() {
+  local needle="$1"
+  local item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
 list_oss_archive_names() {
   local output
   CURRENT_STEP="清点 OSS 远端备份"
@@ -1125,36 +1245,91 @@ list_oss_archive_names() {
 list_sftp_archive_names() {
   local output
   CURRENT_STEP="清点 SFTP 远端备份"
-  output="$(sftp_ssh "for f in '$SFTP_REMOTE_DIR'/dujiao-next-????????-??????.tar; do test -f \"\$f\" && basename -- \"\$f\"; done")"
+  output="$(sftp_ssh "for f in '$SFTP_REMOTE_DIR'/dujiao-next-????????-??????.tar; do if test -f \"\$f\"; then basename -- \"\$f\"; fi; done; exit 0")"
   printf '%s\n' "$output" | parse_archive_names
 }
 
 prune_remote_extras() {
-  local oldest listing_file
-  local -a remote_archives
+  local oldest listing_file archive name marker item
+  local -a local_archives local_names remote_archives extras filtered
+  mapfile -d '' local_archives < <(
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
+      -name 'dujiao-next-????????-??????.tar' -print0 | sort -z
+  )
+  for archive in "${local_archives[@]}"; do
+    local_names+=("$(basename "$archive")")
+  done
+
   if [[ "$OSS_ENABLED" -eq 1 ]]; then
     listing_file="$(mktemp "$TMP_DIR/oss-list.XXXXXX")"
     register_temp "$listing_file"
     list_oss_archive_names > "$listing_file"
     mapfile -t remote_archives < "$listing_file"
+    for archive in "${local_archives[@]}"; do
+      name="$(basename "$archive")"
+      if ! archive_array_contains "$name" "${remote_archives[@]}"; then
+        warn "OSS 中缺少本地保留备份，正在自动补传：$name"
+        marker="$(archive_marker "$name" oss)"
+        rm -f -- "$marker"
+        sync_archive_to_oss "$archive"
+        remote_archives+=("$name")
+      fi
+    done
+    printf '%s\n' "${remote_archives[@]}" | sort -u > "$listing_file"
+    mapfile -t remote_archives < "$listing_file"
+    extras=()
+    for item in "${remote_archives[@]}"; do
+      archive_array_contains "$item" "${local_names[@]}" || extras+=("$item")
+    done
     while [[ "${#remote_archives[@]}" -gt "$MAX_BACKUPS" ]]; do
-      oldest="${remote_archives[0]}"
+      [[ "${#extras[@]}" -gt 0 ]] || die "OSS 数量超过上限，但没有可安全清理的远端额外备份。"
+      oldest="${extras[0]}"
       valid_archive_name "$oldest" || die "拒绝删除异常 OSS 文件名：$oldest"
       delete_oss_archive "$oldest"
-      remote_archives=("${remote_archives[@]:1}")
+      rm -f -- "$(archive_marker "$oldest" oss)"
+      filtered=()
+      for item in "${remote_archives[@]}"; do
+        [[ "$item" == "$oldest" ]] || filtered+=("$item")
+      done
+      remote_archives=("${filtered[@]}")
+      extras=("${extras[@]:1}")
     done
     info "OSS 当前保留 ${#remote_archives[@]} 份标准备份。"
   fi
+
   if [[ "$SFTP_ENABLED" -eq 1 ]]; then
     listing_file="$(mktemp "$TMP_DIR/sftp-list.XXXXXX")"
     register_temp "$listing_file"
     list_sftp_archive_names > "$listing_file"
     mapfile -t remote_archives < "$listing_file"
+    for archive in "${local_archives[@]}"; do
+      name="$(basename "$archive")"
+      if ! archive_array_contains "$name" "${remote_archives[@]}"; then
+        warn "SFTP 中缺少本地保留备份，正在自动补传：$name"
+        marker="$(archive_marker "$name" sftp)"
+        rm -f -- "$marker"
+        sync_archive_to_sftp "$archive"
+        remote_archives+=("$name")
+      fi
+    done
+    printf '%s\n' "${remote_archives[@]}" | sort -u > "$listing_file"
+    mapfile -t remote_archives < "$listing_file"
+    extras=()
+    for item in "${remote_archives[@]}"; do
+      archive_array_contains "$item" "${local_names[@]}" || extras+=("$item")
+    done
     while [[ "${#remote_archives[@]}" -gt "$MAX_BACKUPS" ]]; do
-      oldest="${remote_archives[0]}"
+      [[ "${#extras[@]}" -gt 0 ]] || die "SFTP 数量超过上限，但没有可安全清理的远端额外备份。"
+      oldest="${extras[0]}"
       valid_archive_name "$oldest" || die "拒绝删除异常 SFTP 文件名：$oldest"
       delete_sftp_archive "$oldest"
-      remote_archives=("${remote_archives[@]:1}")
+      rm -f -- "$(archive_marker "$oldest" sftp)"
+      filtered=()
+      for item in "${remote_archives[@]}"; do
+        [[ "$item" == "$oldest" ]] || filtered+=("$item")
+      done
+      remote_archives=("${filtered[@]}")
+      extras=("${extras[@]:1}")
     done
     info "SFTP 当前保留 ${#remote_archives[@]} 份标准备份。"
   fi
@@ -1195,16 +1370,14 @@ apply_retention() {
 
 backup_command() {
   require_root
-  start_log_capture
-  load_config || die "尚未安装或没有配置文件：$CONFIG_FILE"
-  validate_positive_integer "$MAX_BACKUPS" || die "MAX_BACKUPS 必须是正整数。"
-  [[ "$OSS_ENABLED" == "0" || "$OSS_ENABLED" == "1" ]] || die "OSS_ENABLED 配置无效。"
-  [[ "$SFTP_ENABLED" == "0" || "$SFTP_ENABLED" == "1" ]] || die "SFTP_ENABLED 配置无效。"
+  ensure_runtime_dirs
   exec 9> "$LOCK_FILE"
   if ! flock -n 9; then
     warn "已有备份任务正在运行，本次安全跳过。"
     exit 0
   fi
+  start_log_capture
+  load_config || die "尚未安装或没有配置文件：$CONFIG_FILE"
   heading "Dujiao-Next 完整备份开始"
   info "管理器版本：$VERSION"
   info "部署模式：$DEPLOY_MODE；最多保留：$MAX_BACKUPS"
@@ -1216,32 +1389,113 @@ backup_command() {
   success "本次完整备份全部成功。"
 }
 
+validate_tar_member_types() {
+  local archive="$1"
+  local compression="$2"
+  local allowed_types="$3"
+  {
+    if [[ "$compression" == "gzip" ]]; then
+      tar -tvzf "$archive"
+    else
+      tar -tvf "$archive"
+    fi
+  } | awk -v allowed="$allowed_types" '
+    BEGIN { count = 0 }
+    {
+      count++
+      if (index(allowed, substr($1, 1, 1)) == 0) exit 1
+    }
+    END { if (count == 0) exit 1 }
+  '
+}
+
+validate_inner_tar_paths() {
+  local archive="$1"
+  local kind="$2"
+  local listing member count=0
+  local env_count=0 config_count=0 compose_count=0
+  listing="$(mktemp "$TMP_DIR/tar-list.XXXXXX")"
+  register_temp "$listing"
+  tar -tzf "$archive" > "$listing"
+  while IFS= read -r member; do
+    count="$((count + 1))"
+    [[ -n "$member" && "$member" != /* && "$member" != "." && "$member" != ./* \
+      && "$member" != ".." && "$member" != ../* && "$member" != *"//"* \
+      && "$member" != *"/./"* && "$member" != *"/." \
+      && "$member" != *"/../"* && "$member" != *"/.." ]] || return 1
+    case "$kind" in
+      uploads)
+        [[ "$member" == "uploads" || "$member" == "uploads/" || "$member" == uploads/* ]] || return 1
+        ;;
+      config)
+        case "$member" in
+          .env) env_count="$((env_count + 1))" ;;
+          config/config.yml) config_count="$((config_count + 1))" ;;
+          docker-compose.sqlite.yml|docker-compose.postgres.yml) compose_count="$((compose_count + 1))" ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$listing"
+  if [[ "$kind" == "config" ]]; then
+    [[ "$count" -eq 3 && "$env_count" -eq 1 && "$config_count" -eq 1 && "$compose_count" -eq 1 ]]
+  else
+    [[ "$count" -gt 0 ]]
+  fi
+}
+
 verify_archive_file() {
   local archive="$1"
-  local work member database_found=0
-  local -a members
+  local work member database_found=0 database_file=""
+  local uploads_found=0 config_found=0 manifest_found=0 checksums_found=0
+  local expected checksum_name
+  local -a members checksum_files expected_checksum_files
   [[ -f "$archive" ]] || die "备份文件不存在：$archive"
   work="$(mktemp -d "$TMP_DIR/verify.XXXXXX")"
   register_temp "$work"
   CURRENT_STEP="检查 TAR 目录结构"
+  validate_tar_member_types "$archive" plain "-" || die "外层 TAR 含有非普通文件条目。"
   mapfile -t members < <(tar -tf "$archive")
   [[ "${#members[@]}" -eq 5 ]] || die "备份包应包含 5 个文件，实际为 ${#members[@]} 个。"
   for member in "${members[@]}"; do
     case "$member" in
-      database.dump|database.sqlite) database_found="$((database_found + 1))" ;;
-      uploads.tar.gz|config.tar.gz|manifest.txt|SHA256SUMS) ;;
+      database.dump|database.sqlite)
+        database_found="$((database_found + 1))"
+        database_file="$member"
+        ;;
+      uploads.tar.gz) uploads_found="$((uploads_found + 1))" ;;
+      config.tar.gz) config_found="$((config_found + 1))" ;;
+      manifest.txt) manifest_found="$((manifest_found + 1))" ;;
+      SHA256SUMS) checksums_found="$((checksums_found + 1))" ;;
       *) die "备份包含异常路径或文件：$member" ;;
     esac
   done
   [[ "$database_found" -eq 1 ]] || die "备份包必须且只能包含一个数据库文件。"
-  tar -xf "$archive" -C "$work"
+  [[ "$uploads_found" -eq 1 && "$config_found" -eq 1 && "$manifest_found" -eq 1 && "$checksums_found" -eq 1 ]] \
+    || die "备份包内的固定文件必须各出现一次。"
+  tar --no-same-owner --no-same-permissions -xf "$archive" -C "$work"
+  expected_checksum_files=("$database_file" uploads.tar.gz config.tar.gz manifest.txt)
+  if grep -Eqv '^[0-9a-fA-F]{64}  [A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
+    die "SHA256SUMS 格式不安全或不受支持。"
+  fi
+  mapfile -t checksum_files < <(awk '{print $2}' "$work/SHA256SUMS")
+  [[ "${#checksum_files[@]}" -eq 4 ]] || die "SHA256SUMS 必须正好包含 4 条记录。"
+  for expected in "${expected_checksum_files[@]}"; do
+    archive_array_contains "$expected" "${checksum_files[@]}" || die "SHA256SUMS 缺少文件：$expected"
+  done
+  for checksum_name in "${checksum_files[@]}"; do
+    archive_array_contains "$checksum_name" "${expected_checksum_files[@]}" || die "SHA256SUMS 含有异常文件：$checksum_name"
+  done
   CURRENT_STEP="核对备份 SHA256"
   (
     cd "$work"
     sha256sum -c SHA256SUMS
   )
-  tar -tzf "$work/uploads.tar.gz" >/dev/null
-  tar -tzf "$work/config.tar.gz" >/dev/null
+  validate_tar_member_types "$work/uploads.tar.gz" gzip "-d" || die "uploads.tar.gz 含有链接或特殊文件。"
+  validate_tar_member_types "$work/config.tar.gz" gzip "-" || die "config.tar.gz 含有链接或特殊文件。"
+  validate_inner_tar_paths "$work/uploads.tar.gz" uploads || die "uploads.tar.gz 含有不安全路径。"
+  validate_inner_tar_paths "$work/config.tar.gz" config || die "config.tar.gz 含有异常文件或路径。"
   if [[ -f "$work/database.sqlite" ]]; then
     [[ "$(sqlite3 "$work/database.sqlite" 'PRAGMA quick_check;')" == "ok" ]] || die "SQLite 数据库完整性校验失败。"
     success "SQLite 数据库 quick_check 通过。"
@@ -1605,8 +1859,13 @@ install_command() {
   install_base_dependencies
   install_program_files
   if [[ -f "$CONFIG_FILE" ]]; then
-    load_config
-    prompt_yes_no keep_existing "检测到现有配置，是否保留并继续使用" 1
+    if (load_config >/dev/null 2>&1); then
+      load_config
+      prompt_yes_no keep_existing "检测到现有配置，是否保留并继续使用" 1
+    else
+      warn "现有配置无法安全读取，将进入重新配置向导；旧文件会在成功保存时替换。"
+      keep_existing="0"
+    fi
   else
     keep_existing="0"
   fi
@@ -1657,6 +1916,8 @@ self_test() {
   OSS_PREFIX="/dujiao-next/test/"
   result="$(normalize_oss_prefix "$OSS_PREFIX")"
   [[ "$result" == "dujiao-next/test" ]]
+  result="$(normalize_oss_prefix '///dujiao-next/test///')"
+  [[ "$result" == "dujiao-next/test" ]]
   valid_archive_name "dujiao-next-20260815-123456.tar"
   if valid_archive_name "dujiao-next-20260815-123456.tar.bad"; then return 1; fi
   TIMER_DAYS=0
@@ -1665,11 +1926,18 @@ self_test() {
   [[ "$(timer_total_seconds)" -eq 120 ]]
   is_safe_absolute_path "/root/dujiao-backups"
   if is_safe_absolute_path "/root/../etc"; then return 1; fi
+  if is_safe_absolute_path "/root/."; then return 1; fi
+  validate_uint_between "8" 0 23
+  if validate_uint_between "08" 0 23; then return 1; fi
   result="$(printf '%s\n' \
     'oss://bucket/prefix/dujiao-next-20260815-123457.tar' \
     'summary line' \
     'oss://bucket/prefix/dujiao-next-20260815-123456.tar' | parse_archive_names)"
   [[ "$result" == $'dujiao-next-20260815-123456.tar\ndujiao-next-20260815-123457.tar' ]]
+  archive_array_contains "b" "a" "b" "c"
+  if archive_array_contains "x" "a" "b" "c"; then return 1; fi
+  result="$(printf '%s\n' '{' '  "Content-Length": "123",' '  "X-Oss-Meta-Dujiao-Sha256": "abc"' '}' | json_string_field 'Content-Length')"
+  [[ "$result" == "123" ]]
   printf 'self-test: OK (v%s)\n' "$VERSION"
 }
 

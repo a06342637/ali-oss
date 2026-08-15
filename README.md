@@ -2,7 +2,7 @@
 
 专用于 [Dujiao-Next 官方 Docker Compose 部署](https://dujiao-next.com/deploy/docker-compose) 的交互式完整备份管理器。
 
-当前版本：`v1.1.3`
+当前版本：`v1.1.4`
 
 支持：
 
@@ -232,6 +232,8 @@ Redis 不备份。Dujiao-Next 的 Redis 用于缓存和队列，业务真数据�
 - 本地、OSS 和 SFTP 删除相同文件名
 - 如果任一远端上传失败，不执行保留清理，允许本地暂时超过 100 份，优先避免丢失备份
 - 下次运行会继续同步尚未成功的本地备份
+- 如果远端某份保留中的备份被人工删除或被生命周期规则清除，下次运行会根据本地保留副本自动补传
+- OSS 每次上传后都会核对远端大小及脚本写入的 SHA256 元数据；SFTP 会在远端直接计算 SHA256
 - 切换 Bucket、OSS 目录、SFTP 主机或远端目录后，目标指纹会变化，现有本地备份会同步到新目标
 
 所以手动运行一次时，如果发现多份本地备份尚未同步，日志中可能会连续上传多份，这是正常的补传行为。
@@ -327,6 +329,8 @@ dujiao-backup update
 ```text
 /opt/dujiao-backup/logs/dujiao-backup.log
 ```
+
+日志达到 10 MiB 后会自动轮转，保留 `dujiao-backup.log.1` 到 `.5`，避免日志无限增长。
 
 查看最近日志：
 
