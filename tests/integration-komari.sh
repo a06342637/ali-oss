@@ -85,7 +85,9 @@ printf '%s\n' \
   n \
   '' \
   '   ' \
-  n | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' install" "$install_transcript"
+  n | python3 "$repo_dir/tests/pty-run.py" \
+    --transcript "$install_transcript" --timeout 90 \
+    -- bash "$repo_dir/dujiao-backup.sh" install
 tr -d '\r' < "$install_transcript" > "$install_output"
 
 grep -Fq '安装 Dujiao-Next / Komari Backup Manager v1.2.1' "$install_output"
@@ -185,7 +187,9 @@ printf '%s\n' \
   y \
   '' \
   0 \
-  0 | timeout 60s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" /dev/null
+  0 | python3 "$repo_dir/tests/pty-run.py" \
+    --transcript /tmp/komari-configure.typescript --timeout 60 \
+    -- bash "$repo_dir/dujiao-backup.sh" configure
 (
   # shellcheck disable=SC1091
   source /opt/dujiao-backup/config.conf

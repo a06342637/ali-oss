@@ -138,7 +138,9 @@ printf '%s\n' \
   1 \
   '' \
   0 \
-  0 | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" "$menu_transcript"
+  0 | python3 "$repo_dir/tests/pty-run.py" \
+    --transcript "$menu_transcript" --timeout 90 \
+    -- bash "$repo_dir/dujiao-backup.sh" configure
 tr -d '\r' < "$menu_transcript" > "$menu_output"
 invalid_count="$(grep -oF '空值或纯空格无效' "$menu_output" | wc -l | tr -d ' ')"
 test "$invalid_count" -ge 4
