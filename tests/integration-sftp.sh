@@ -11,6 +11,8 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 app_dir="/tmp/dujiao-next-sftp-test"
 fake_bin="/tmp/dujiao-backup-sftp-bin"
 config_tmp="/tmp/dujiao-backup-sftp-config"
+menu_transcript="/tmp/dujiao-backup-sftp-menu.typescript"
+menu_output="/tmp/dujiao-backup-sftp-menu.output"
 ssh_host="${TEST_SFTP_HOST:-127.0.0.1}"
 ssh_port="${TEST_SFTP_PORT:-22222}"
 ssh_user="${TEST_SFTP_USER:-backup}"
@@ -20,7 +22,7 @@ key_file="/opt/dujiao-backup/keys/sftp_ed25519"
 known_hosts="/opt/dujiao-backup/keys/known_hosts"
 
 rm -rf -- "$app_dir" "$fake_bin"
-rm -f -- "$config_tmp"
+rm -f -- "$config_tmp" "$menu_transcript" "$menu_output"
 rm -rf -- /opt/dujiao-backup
 install -d -m 0700 /opt/dujiao-backup /opt/dujiao-backup/keys
 install -d -m 0700 /root/.ssh
@@ -124,15 +126,26 @@ export PATH="$fake_bin:$PATH"
 printf '%s\n' \
   5 \
   6 \
+  '' \
+  '   ' \
   '/config/dujiao-backups-menu' \
   '' \
   2 \
+  '' \
+  '   ' \
   y \
   '' \
   1 \
   '' \
   0 \
-  0 | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" /dev/null
+  0 | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" "$menu_transcript"
+tr -d '\r' < "$menu_transcript" > "$menu_output"
+invalid_count="$(grep -oF '空值或纯空格无效' "$menu_output" | wc -l | tr -d ' ')"
+test "$invalid_count" -ge 4
+if grep -E '(远端保存目录|确认停用).*\[(INFO|WARN|SUCCESS|ERROR)\]' "$menu_output"; then
+  printf 'SFTP configuration prompt and log output were joined on one line.\n' >&2
+  exit 1
+fi
 (
   # shellcheck disable=SC1091
   source /opt/dujiao-backup/config.conf

@@ -11,9 +11,11 @@ app_dir="/tmp/dujiao-next-oss-test"
 fake_bin="/tmp/dujiao-backup-oss-bin"
 remote_root="/tmp/dujiao-backup-fake-oss"
 config_tmp="/tmp/dujiao-backup-oss-config"
+menu_transcript="/tmp/dujiao-backup-oss-menu.typescript"
+menu_output="/tmp/dujiao-backup-oss-menu.output"
 
 rm -rf -- "$app_dir" "$fake_bin" "$remote_root"
-rm -f -- "$config_tmp"
+rm -f -- "$config_tmp" "$menu_transcript" "$menu_output"
 rm -rf -- /opt/dujiao-backup
 install -d -m 0700 /opt/dujiao-backup
 mkdir -p "$app_dir/config" "$app_dir/data/db" "$app_dir/data/uploads"
@@ -86,31 +88,73 @@ export PATH="$fake_bin:$PATH"
 export FAKE_OSS_ROOT="$remote_root"
 printf '%s\n' \
   4 \
-  8 \
+  10 \
+  '' \
+  '   ' \
+  'test-id-2' \
+  '' \
+  '   ' \
+  'test-secret-2' \
+  '' \
+  '   ' \
+  'cn-hangzhou' \
+  '' \
+  '   ' \
+  'oss-cn-hangzhou.aliyuncs.com' \
+  '' \
+  '   ' \
+  'test-bucket' \
+  '' \
+  '   ' \
   'dujiao-next/menu-host' \
   '' \
+  '   ' \
+  y \
+  '' \
+  '   ' \
+  y \
+  '' \
   2 \
+  '' \
+  '   ' \
   y \
   '' \
   1 \
   '' \
   0 \
   3 \
+  '' \
+  '   ' \
   3 \
   '' \
   6 \
   2 \
+  '' \
+  '   ' \
   0 \
+  '' \
+  '   ' \
   1 \
+  '' \
+  '   ' \
   15 \
   '' \
   0 \
-  0 | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" /dev/null
+  0 | timeout 120s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" "$menu_transcript"
+tr -d '\r' < "$menu_transcript" > "$menu_output"
+invalid_count="$(grep -oF '空值或纯空格无效' "$menu_output" | wc -l | tr -d ' ')"
+test "$invalid_count" -ge 26
+if grep -E '(AccessKey|Region ID|公网 Endpoint|Bucket 名称|OSS 内保存目录|这个 Bucket|超过保留数|确认停用|最多保留|天数|小时|分钟).*\[(INFO|WARN|SUCCESS|ERROR)\]' "$menu_output"; then
+  printf 'OSS configuration prompt and log output were joined on one line.\n' >&2
+  exit 1
+fi
 (
   # shellcheck disable=SC1091
   source /opt/dujiao-backup/config.conf
   test "$OSS_ENABLED" = "1"
   test "$SFTP_ENABLED" = "0"
+  test "$OSS_ACCESS_KEY_ID" = "test-id-2"
+  test "$OSS_ACCESS_KEY_SECRET" = "test-secret-2"
   test "$OSS_PREFIX" = "dujiao-next/menu-host"
   test "$OSS_VERSIONING_ENABLED" = "1"
   test "$OSS_DELETE_ALL_VERSIONS" = "1"

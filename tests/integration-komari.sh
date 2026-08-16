@@ -12,6 +12,8 @@ fake_bin="/tmp/komari-backup-test-bin"
 config_tmp="/tmp/komari-backup-test-config"
 restore_dir="/tmp/komari-backup-restore"
 release_file="/tmp/komari-backup-release"
+install_transcript="/tmp/komari-install.typescript"
+install_output="/tmp/komari-install.output"
 writer_pid=""
 
 cleanup_test() {
@@ -19,13 +21,16 @@ cleanup_test() {
   if [[ -n "$writer_pid" ]]; then
     wait "$writer_pid" 2>/dev/null || true
   fi
+  if [[ -L /usr/local/bin/dujiao-backup ]] \
+    && [[ "$(readlink -f /usr/local/bin/dujiao-backup)" == "/opt/dujiao-backup/dujiao-backup.sh" ]]; then
+    rm -f -- /usr/local/bin/dujiao-backup
+  fi
 }
 trap cleanup_test EXIT
 
 rm -rf -- /tmp/komari-backup-test /tmp/komari-backup-test-bin /tmp/komari-backup-restore
-rm -f -- "$config_tmp" "$release_file"
+rm -f -- "$config_tmp" "$release_file" "$install_transcript" "$install_output"
 rm -rf -- /opt/dujiao-backup
-install -d -m 0700 /opt/dujiao-backup
 mkdir -p "$data_dir/theme/Emerald" "$fake_bin" "$restore_dir"
 printf 'theme-data\n' > "$data_dir/theme/Emerald/komari-theme.json"
 sqlite3 "$data_dir/komari.db" <<'SQL'
@@ -50,6 +55,67 @@ printf '%s\n' \
   'fi' \
   'exit 0' > "$fake_bin/docker"
 chmod 0755 "$fake_bin/docker"
+
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -Eeuo pipefail' \
+  'exit 0' > "$fake_bin/apt-get"
+chmod 0755 "$fake_bin/apt-get"
+
+export PATH="$fake_bin:$PATH"
+export FAKE_KOMARI_DATA_DIR="$data_dir"
+printf '%s\n' \
+  '' \
+  '   ' \
+  4 \
+  '' \
+  '   ' \
+  2 \
+  '' \
+  '   ' \
+  komari \
+  '' \
+  '   ' \
+  y \
+  '' \
+  '   ' \
+  2 \
+  '' \
+  '   ' \
+  n \
+  '' \
+  '   ' \
+  n | timeout 90s script -qec "bash '$repo_dir/dujiao-backup.sh' install" "$install_transcript"
+tr -d '\r' < "$install_transcript" > "$install_output"
+
+grep -Fq '安装 Dujiao-Next / Komari Backup Manager v1.2.1' "$install_output"
+grep -Fq '选择备份目标' "$install_output"
+grep -Fq '选择要备份的业务' "$install_output"
+grep -Fq '识别 Komari 探针面板 Docker 部署' "$install_output"
+grep -Fq '设置备份保留数量' "$install_output"
+grep -Fq '配置自动备份' "$install_output"
+grep -Fq '安装成功' "$install_output"
+install_line="$(awk 'index($0, "安装 Dujiao-Next / Komari Backup Manager v1.2.1") { print NR; exit }' "$install_output")"
+target_line="$(awk 'index($0, "选择备份目标") { print NR; exit }' "$install_output")"
+business_line="$(awk 'index($0, "选择要备份的业务") { print NR; exit }' "$install_output")"
+komari_line="$(awk 'index($0, "识别 Komari 探针面板 Docker 部署") { print NR; exit }' "$install_output")"
+retention_line="$(awk 'index($0, "设置备份保留数量") { print NR; exit }' "$install_output")"
+timer_line="$(awk 'index($0, "配置自动备份") { print NR; exit }' "$install_output")"
+success_line="$(awk 'index($0, "安装成功") { print NR; exit }' "$install_output")"
+(( install_line < target_line \
+  && target_line < business_line \
+  && business_line < komari_line \
+  && komari_line < retention_line \
+  && retention_line < timer_line \
+  && timer_line < success_line ))
+invalid_count="$(grep -oF '空值或纯空格无效' "$install_output" | wc -l | tr -d ' ')"
+test "$invalid_count" -ge 14
+if grep -E '(请选择|Komari 容器名|确认使用|最多保留|是否启用|是否现在).*\[(INFO|WARN|SUCCESS|ERROR)\]' "$install_output"; then
+  printf 'Interactive prompt and log output were joined on one line.\n' >&2
+  exit 1
+fi
+grep -Fq '基础依赖安装完成。' /opt/dujiao-backup/logs/dujiao-backup.log
+grep -Fq 'start_log_capture interactive' "$repo_dir/dujiao-backup.sh"
 
 printf '%s\n' \
   'CONFIG_VERSION=1' \
@@ -108,13 +174,15 @@ tar -xf "$latest" -C "$restore_dir"
 tar -xzf "$restore_dir/data.tar.gz" -C "$restore_dir"
 test "$(sqlite3 "$restore_dir/data/komari.db" 'SELECT count(*) FROM nodes;')" = "2"
 
-export PATH="$fake_bin:$PATH"
-export FAKE_KOMARI_DATA_DIR="$data_dir"
 printf '%s\n' \
   2 \
   1 \
   '' \
+  '   ' \
+  komari \
   '' \
+  '   ' \
+  y \
   '' \
   0 \
   0 | timeout 60s script -qec "bash '$repo_dir/dujiao-backup.sh' configure" /dev/null

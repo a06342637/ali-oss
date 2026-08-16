@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROGRAM_NAME="Dujiao-Next / Komari Backup Manager"
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -168,19 +168,38 @@ rotate_logs_if_needed() {
 }
 
 start_log_capture() {
+  local mode="${1:-full}"
   ensure_runtime_dirs
-  if [[ "$LOG_CAPTURED" -eq 0 ]]; then
-    rotate_logs_if_needed
-    exec > >(tee -a "$LOG_FILE") 2>&1
-    LOG_CAPTURED=1
+  [[ "$LOG_CAPTURED" -eq 0 ]] || return 0
+  rotate_logs_if_needed
+  if [[ "$mode" == "interactive" ]]; then
+    # 交互提示必须与标题、状态信息走同一个同步终端通道。
+    # 日志消息仍由 write_log_only() 逐行写入日志，避免后台 tee
+    # 延迟输出后插入下一条提示，造成菜单缺行、错位或内容粘连。
+    exec > /dev/tty 2>&1
+    return 0
   fi
+  [[ "$mode" == "full" ]] || die "未知日志捕获模式：$mode"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  LOG_CAPTURED=1
 }
 
 pause_for_enter() {
   if [[ -r /dev/tty ]]; then
-    printf '\n按回车键继续...' > /dev/tty
+    printf '\n按回车键继续...'
     IFS= read -r _ < /dev/tty || true
   fi
+}
+
+trim_outer_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+is_blank_input() {
+  [[ "$1" =~ ^[[:space:]]*$ ]]
 }
 
 prompt_text() {
@@ -191,16 +210,23 @@ prompt_text() {
   local prompt_text_input
   require_tty
   while true; do
-    if [[ -n "$prompt_text_default" ]]; then
-      printf '%s [%s]: ' "$prompt_text_message" "$prompt_text_default" > /dev/tty
+    if [[ "$prompt_text_required" -eq 1 && -n "$prompt_text_default" ]]; then
+      printf '%s（参考值：%s，必须输入）: ' "$prompt_text_message" "$prompt_text_default"
+    elif [[ "$prompt_text_required" -eq 1 ]]; then
+      printf '%s（必须输入）: ' "$prompt_text_message"
+    elif [[ -n "$prompt_text_default" ]]; then
+      printf '%s [%s，直接回车使用]: ' "$prompt_text_message" "$prompt_text_default"
     else
-      printf '%s: ' "$prompt_text_message" > /dev/tty
+      printf '%s: ' "$prompt_text_message"
     fi
     IFS= read -r prompt_text_input < /dev/tty
-    [[ -n "$prompt_text_input" ]] || prompt_text_input="$prompt_text_default"
-    if [[ "$prompt_text_required" -eq 1 && -z "$prompt_text_input" ]]; then
-      printf '此项不能为空，请重新输入。\n' > /dev/tty
+    prompt_text_input="$(trim_outer_whitespace "$prompt_text_input")"
+    if [[ "$prompt_text_required" -eq 1 ]] && is_blank_input "$prompt_text_input"; then
+      printf '此项必须输入有效内容，空值或纯空格无效，请重新输入。\n'
       continue
+    fi
+    if [[ "$prompt_text_required" -eq 0 ]] && is_blank_input "$prompt_text_input"; then
+      prompt_text_input="$prompt_text_default"
     fi
     printf -v "$prompt_text_variable_name" '%s' "$prompt_text_input"
     return 0
@@ -215,15 +241,14 @@ prompt_secret() {
   require_tty
   while true; do
     if [[ -n "$prompt_secret_existing" ]]; then
-      printf '%s（直接回车保留现有值）: ' "$prompt_secret_message" > /dev/tty
+      printf '%s（已有保存值，本次仍必须重新输入）: ' "$prompt_secret_message"
     else
-      printf '%s: ' "$prompt_secret_message" > /dev/tty
+      printf '%s（必须输入）: ' "$prompt_secret_message"
     fi
     IFS= read -r -s prompt_secret_input < /dev/tty
-    printf '\n' > /dev/tty
-    [[ -n "$prompt_secret_input" ]] || prompt_secret_input="$prompt_secret_existing"
-    if [[ -z "$prompt_secret_input" ]]; then
-      printf '此项不能为空，请重新输入。\n' > /dev/tty
+    printf '\n'
+    if is_blank_input "$prompt_secret_input"; then
+      printf '此项必须输入有效内容，空值或纯空格无效，请重新输入。\n'
       continue
     fi
     printf -v "$prompt_secret_variable_name" '%s' "$prompt_secret_input"
@@ -237,15 +262,14 @@ prompt_yes_no() {
   local prompt_yes_no_default="$3"
   local prompt_yes_no_suffix prompt_yes_no_answer
   require_tty
-  [[ "$prompt_yes_no_default" == "1" ]] && prompt_yes_no_suffix="Y/n" || prompt_yes_no_suffix="y/N"
+  [[ "$prompt_yes_no_default" == "1" ]] \
+    && prompt_yes_no_suffix="y/n，建议 y，必须输入" \
+    || prompt_yes_no_suffix="y/n，建议 n，必须输入"
   while true; do
-    printf '%s [%s]: ' "$prompt_yes_no_message" "$prompt_yes_no_suffix" > /dev/tty
+    printf '%s [%s]: ' "$prompt_yes_no_message" "$prompt_yes_no_suffix"
     IFS= read -r prompt_yes_no_answer < /dev/tty
+    prompt_yes_no_answer="$(trim_outer_whitespace "$prompt_yes_no_answer")"
     prompt_yes_no_answer="${prompt_yes_no_answer,,}"
-    if [[ -z "$prompt_yes_no_answer" ]]; then
-      printf -v "$prompt_yes_no_variable_name" '%s' "$prompt_yes_no_default"
-      return 0
-    fi
     case "$prompt_yes_no_answer" in
       y|yes|1|是)
         printf -v "$prompt_yes_no_variable_name" '%s' "1"
@@ -255,7 +279,7 @@ prompt_yes_no() {
         printf -v "$prompt_yes_no_variable_name" '%s' "0"
         return 0
         ;;
-      *) printf '请输入 y 或 n。\n' > /dev/tty ;;
+      *) printf '必须明确输入 y 或 n，空值或纯空格无效。\n' ;;
     esac
   done
 }
@@ -269,14 +293,15 @@ prompt_choice() {
   local prompt_choice_input
   require_tty
   while true; do
-    printf '%s [%s]: ' "$prompt_choice_message" "$prompt_choice_default" > /dev/tty
+    printf '%s（参考值：%s，必须输入）: ' "$prompt_choice_message" "$prompt_choice_default"
     IFS= read -r prompt_choice_input < /dev/tty
-    prompt_choice_input="${prompt_choice_input:-$prompt_choice_default}"
+    prompt_choice_input="$(trim_outer_whitespace "$prompt_choice_input")"
     if validate_uint_between "$prompt_choice_input" "$prompt_choice_minimum" "$prompt_choice_maximum"; then
       printf -v "$prompt_choice_variable_name" '%s' "$prompt_choice_input"
       return 0
     fi
-    printf '请输入 %s 到 %s 之间的数字。\n' "$prompt_choice_minimum" "$prompt_choice_maximum" > /dev/tty
+    printf '必须输入 %s 到 %s 之间的数字，空值或纯空格无效。\n' \
+      "$prompt_choice_minimum" "$prompt_choice_maximum"
   done
 }
 
@@ -288,14 +313,15 @@ prompt_uint_range() {
   local prompt_uint_input
   require_tty
   while true; do
-    printf '%s [%s]: ' "$prompt_uint_message" "$prompt_uint_default" > /dev/tty
+    printf '%s（参考值：%s，必须输入）: ' "$prompt_uint_message" "$prompt_uint_default"
     IFS= read -r prompt_uint_input < /dev/tty
-    prompt_uint_input="${prompt_uint_input:-$prompt_uint_default}"
+    prompt_uint_input="$(trim_outer_whitespace "$prompt_uint_input")"
     if validate_uint_between "$prompt_uint_input" 0 "$prompt_uint_maximum"; then
       printf -v "$prompt_uint_variable_name" '%s' "$prompt_uint_input"
       return 0
     fi
-    printf '请输入 0 到 %s 之间的整数。\n' "$prompt_uint_maximum" > /dev/tty
+    printf '必须输入 0 到 %s 之间的整数，空值或纯空格无效。\n' \
+      "$prompt_uint_maximum"
   done
 }
 
@@ -1721,7 +1747,7 @@ backup_command() {
     warn "已有备份任务正在运行，本次安全跳过。"
     exit 0
   fi
-  start_log_capture
+  start_log_capture full
   load_config || die "尚未安装或没有配置文件：$CONFIG_FILE"
   heading "$(backup_type_label)完整备份开始"
   info "管理器版本：$VERSION"
@@ -2649,7 +2675,7 @@ install_command() {
   local keep_existing run_now
   require_root
   require_tty
-  start_log_capture
+  start_log_capture interactive
   heading "安装 $PROGRAM_NAME v$VERSION"
   info "程序、配置、日志、密钥与备份将统一放在：$INSTALL_DIR"
   install_base_dependencies
@@ -2737,6 +2763,11 @@ self_test() {
   if is_safe_absolute_path "/root/."; then return 1; fi
   validate_uint_between "8" 0 23
   if validate_uint_between "08" 0 23; then return 1; fi
+  is_blank_input ""
+  is_blank_input "   "
+  is_blank_input $' \t '
+  if is_blank_input " value "; then return 1; fi
+  [[ "$(trim_outer_whitespace $' \tvalue \t')" == "value" ]]
   result="$(printf '%s\n' \
     'oss://bucket/prefix/komari-20260815-123457.tar' \
     'summary line' \
