@@ -23,6 +23,7 @@ rm -rf -- "$app_dir" "$fake_bin"
 rm -f -- "$config_tmp"
 rm -rf -- /opt/dujiao-backup
 install -d -m 0700 /opt/dujiao-backup /opt/dujiao-backup/keys
+install -d -m 0700 /root/.ssh
 mkdir -p "$app_dir/config" "$app_dir/data/db" "$app_dir/data/uploads" "$fake_bin"
 printf 'TAG=latest\n' > "$app_dir/.env"
 printf 'database:\n  driver: sqlite\n' > "$app_dir/config/config.yml"

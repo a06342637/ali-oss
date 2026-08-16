@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-readonly PROGRAM_NAME="Dujiao-Next Backup Manager"
-readonly VERSION="1.1.5"
+readonly PROGRAM_NAME="Dujiao-Next / Komari Backup Manager"
+readonly VERSION="1.2.0"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -31,11 +31,15 @@ ACTIVE_PARTIAL=""
 declare -a TEMP_PATHS=()
 
 CONFIG_VERSION="1"
+BACKUP_TYPE="dujiao"
 APP_DIR="/opt/dujiao-next"
 DEPLOY_MODE=""
 COMPOSE_FILE=""
 DB_FILE=""
 PG_CONTAINER="dujiaonext-postgres"
+KOMARI_CONTAINER="komari"
+KOMARI_DATA_DIR="/komari/data"
+KOMARI_DB_FILE="/komari/data/komari.db"
 MAX_BACKUPS="100"
 OSS_ENABLED="0"
 OSS_ACCESS_KEY_ID=""
@@ -50,7 +54,7 @@ SFTP_ENABLED="0"
 SFTP_HOST=""
 SFTP_PORT="22"
 SFTP_USER="root"
-SFTP_REMOTE_DIR="/root/dujiao-backups"
+SFTP_REMOTE_DIR="/root/server-backups"
 SFTP_KEY_FILE="$KEY_DIR/sftp_ed25519"
 SFTP_KNOWN_HOSTS="$KEY_DIR/known_hosts"
 TIMER_ENABLED="0"
@@ -297,11 +301,15 @@ prompt_uint_range() {
 
 set_config_defaults() {
   CONFIG_VERSION="1"
+  BACKUP_TYPE="dujiao"
   APP_DIR="/opt/dujiao-next"
   DEPLOY_MODE=""
   COMPOSE_FILE=""
   DB_FILE=""
   PG_CONTAINER="dujiaonext-postgres"
+  KOMARI_CONTAINER="komari"
+  KOMARI_DATA_DIR="/komari/data"
+  KOMARI_DB_FILE="/komari/data/komari.db"
   MAX_BACKUPS="100"
   OSS_ENABLED="0"
   OSS_ACCESS_KEY_ID=""
@@ -316,7 +324,7 @@ set_config_defaults() {
   SFTP_HOST=""
   SFTP_PORT="22"
   SFTP_USER="root"
-  SFTP_REMOTE_DIR="/root/dujiao-backups"
+  SFTP_REMOTE_DIR="/root/server-backups"
   SFTP_KEY_FILE="$KEY_DIR/sftp_ed25519"
   SFTP_KNOWN_HOSTS="$KEY_DIR/known_hosts"
   TIMER_ENABLED="0"
@@ -337,13 +345,18 @@ load_config() {
     return 1
   fi
   APP_DIR="$(normalize_absolute_path "$APP_DIR")"
+  KOMARI_DATA_DIR="$(normalize_absolute_path "$KOMARI_DATA_DIR")"
   SFTP_REMOTE_DIR="$(normalize_absolute_path "$SFTP_REMOTE_DIR")"
   [[ "$OSS_DELETE_ALL_VERSIONS" == "1" ]] && OSS_VERSIONING_ENABLED="1"
   # 密钥文件属于管理器内部状态，不接受配置文件改写到任意系统路径。
   SFTP_KEY_FILE="$KEY_DIR/sftp_ed25519"
   SFTP_KNOWN_HOSTS="$KEY_DIR/known_hosts"
   validate_loaded_config
-  set_deployment_paths
+  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
+    set_deployment_paths
+  else
+    set_komari_paths
+  fi
 }
 
 write_config_value() {
@@ -356,15 +369,18 @@ save_config() {
   local temporary="$CONFIG_FILE.new.$$"
   CURRENT_STEP="写入配置文件"
   {
-    printf '# Dujiao-Next Backup Manager v%s\n' "$VERSION"
+    printf '# Dujiao-Next / Komari Backup Manager v%s\n' "$VERSION"
     printf '# 本文件含 OSS 密钥，只允许 root 读取。请优先通过管理菜单修改。\n'
     printf '# SFTP 登录密码不会保存；这里只保存专用 SSH 私钥路径。\n\n'
     printf 'CONFIG_VERSION=%q\n' "$CONFIG_VERSION"
+    write_config_value BACKUP_TYPE
     write_config_value APP_DIR
     write_config_value DEPLOY_MODE
     write_config_value COMPOSE_FILE
     write_config_value DB_FILE
     write_config_value PG_CONTAINER
+    write_config_value KOMARI_CONTAINER
+    write_config_value KOMARI_DATA_DIR
     write_config_value MAX_BACKUPS
     write_config_value OSS_ENABLED
     write_config_value OSS_ACCESS_KEY_ID
@@ -410,8 +426,11 @@ validate_uint_between() {
 
 validate_loaded_config() {
   [[ "$CONFIG_VERSION" == "1" ]] || die "CONFIG_VERSION 配置无效。"
+  [[ "$BACKUP_TYPE" == "dujiao" || "$BACKUP_TYPE" == "komari" ]] || die "BACKUP_TYPE 配置必须是 dujiao 或 komari。"
   is_safe_absolute_path "$APP_DIR" || die "APP_DIR 必须是安全的绝对路径。"
   [[ "$PG_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "PG_CONTAINER 配置无效。"
+  [[ "$KOMARI_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "KOMARI_CONTAINER 配置无效。"
+  is_safe_absolute_path "$KOMARI_DATA_DIR" || die "KOMARI_DATA_DIR 必须是安全的绝对路径。"
   if ! validate_uint_between "$MAX_BACKUPS" 1 10000; then
     die "MAX_BACKUPS 必须是 1 到 10000。"
   fi
@@ -425,10 +444,12 @@ validate_loaded_config() {
   validate_uint_between "$TIMER_HOURS" 0 23 || die "TIMER_HOURS 配置无效。"
   validate_uint_between "$TIMER_MINUTES" 0 59 || die "TIMER_MINUTES 配置无效。"
   validate_uint_between "$SFTP_PORT" 1 65535 || die "SFTP_PORT 配置无效。"
-  case "$DEPLOY_MODE" in
-    sqlite|postgres) ;;
-    *) die "DEPLOY_MODE 配置必须是 sqlite 或 postgres。" ;;
-  esac
+  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
+    case "$DEPLOY_MODE" in
+      sqlite|postgres) ;;
+      *) die "Dujiao DEPLOY_MODE 配置必须是 sqlite 或 postgres。" ;;
+    esac
+  fi
   if [[ "$TIMER_ENABLED" -eq 1 ]]; then
     [[ "$((TIMER_DAYS * 86400 + TIMER_HOURS * 3600 + TIMER_MINUTES * 60))" -ge 60 ]] || die "启用定时时，间隔不能全部为 0。"
   fi
@@ -484,6 +505,30 @@ set_deployment_paths() {
       ;;
     *) die "部署模式必须是 sqlite 或 postgres。" ;;
   esac
+}
+
+set_komari_paths() {
+  KOMARI_DB_FILE="$KOMARI_DATA_DIR/komari.db"
+}
+
+backup_type_label() {
+  case "$BACKUP_TYPE" in
+    dujiao) printf '发卡备份（Dujiao-Next）' ;;
+    komari) printf '探针备份（Komari）' ;;
+    *) printf '未知备份类型' ;;
+  esac
+}
+
+archive_prefix() {
+  case "$BACKUP_TYPE" in
+    dujiao) printf 'dujiao-next' ;;
+    komari) printf 'komari' ;;
+    *) return 1 ;;
+  esac
+}
+
+current_archive_pattern() {
+  printf '%s-????????-??????.tar' "$(archive_prefix)"
 }
 
 detect_deployment_mode() {
@@ -574,6 +619,130 @@ choose_deployment_interactive() {
   CURRENT_STEP="检查 Dujiao-Next 部署"
   validate_deployment
   success "Dujiao-Next 部署检查通过。"
+}
+
+komari_mount_source() {
+  local container="$1"
+  local output line_count
+  output="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{println .Source}}{{end}}{{end}}' \
+    "$container" 2>/dev/null | sed '/^[[:space:]]*$/d')"
+  [[ -n "$output" ]] || return 1
+  line_count="$(printf '%s\n' "$output" | wc -l | tr -d ' ')"
+  [[ "$line_count" -eq 1 ]] || return 1
+  printf '%s' "$output"
+}
+
+detect_komari_container() {
+  local id name image source found="" count=0
+  if docker inspect "$KOMARI_CONTAINER" >/dev/null 2>&1 \
+    && source="$(komari_mount_source "$KOMARI_CONTAINER")"; then
+    printf '%s' "$KOMARI_CONTAINER"
+    return 0
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    image="$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null || true)"
+    case "$image" in
+      *komari-monitor/komari*) ;;
+      *) continue ;;
+    esac
+    source="$(komari_mount_source "$id" 2>/dev/null || true)"
+    [[ -n "$source" ]] || continue
+    name="$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')"
+    [[ -n "$name" ]] || continue
+    found="$name"
+    count="$((count + 1))"
+  done < <(docker ps -aq)
+  [[ "$count" -eq 1 ]] || return 1
+  printf '%s' "$found"
+}
+
+validate_komari_deployment() {
+  local actual_source
+  command -v docker >/dev/null 2>&1 || die "没有找到 Docker；请先完成 Komari Docker 部署。"
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 尚未安装。"
+  [[ "$KOMARI_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Komari 容器名格式不正确。"
+  docker inspect "$KOMARI_CONTAINER" >/dev/null 2>&1 || die "没有找到 Komari 容器：$KOMARI_CONTAINER"
+  actual_source="$(komari_mount_source "$KOMARI_CONTAINER")" \
+    || die "容器 $KOMARI_CONTAINER 没有唯一挂载到 /app/data 的数据目录。"
+  actual_source="$(normalize_absolute_path "$actual_source")"
+  [[ "$actual_source" == "$KOMARI_DATA_DIR" ]] \
+    || die "Komari 数据挂载已变化：配置为 $KOMARI_DATA_DIR，容器实际为 $actual_source；请在菜单重新识别。"
+  is_safe_absolute_path "$KOMARI_DATA_DIR" || die "Komari 数据目录必须是安全的绝对路径。"
+  [[ -d "$KOMARI_DATA_DIR" && ! -L "$KOMARI_DATA_DIR" ]] || die "Komari 数据目录不存在或是符号链接：$KOMARI_DATA_DIR"
+  set_komari_paths
+  [[ -f "$KOMARI_DB_FILE" && ! -L "$KOMARI_DB_FILE" ]] || die "没有找到 Komari SQLite 数据库：$KOMARI_DB_FILE"
+  sqlite3 "$KOMARI_DB_FILE" 'PRAGMA schema_version;' >/dev/null \
+    || die "无法读取 Komari SQLite 数据库：$KOMARI_DB_FILE"
+}
+
+choose_komari_interactive() {
+  local detected container_name data_dir image running confirmed
+  heading "识别 Komari 探针面板 Docker 部署"
+  command -v docker >/dev/null 2>&1 || die "没有找到 Docker；请先完成 Komari Docker 部署。"
+  detected="$(detect_komari_container 2>/dev/null || true)"
+  if [[ -n "$detected" ]]; then
+    info "已自动识别 Komari 容器：$detected"
+  else
+    warn "未能唯一自动识别 Komari 容器，请手工确认容器名。"
+    detected="$KOMARI_CONTAINER"
+  fi
+  prompt_text container_name "Komari 容器名" "$detected" 1
+  [[ "$container_name" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Komari 容器名格式不正确。"
+  docker inspect "$container_name" >/dev/null 2>&1 || die "没有找到容器：$container_name"
+  data_dir="$(komari_mount_source "$container_name")" \
+    || die "容器 $container_name 没有唯一挂载到 /app/data 的数据目录。请检查 Docker Compose volumes。"
+  data_dir="$(normalize_absolute_path "$data_dir")"
+  is_safe_absolute_path "$data_dir" || die "检测到的数据目录不是安全的绝对路径：$data_dir"
+  image="$(docker inspect --format '{{.Config.Image}}' "$container_name" 2>/dev/null || printf 'unknown')"
+  running="$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || printf 'false')"
+  printf '\n容器镜像       : %s\n' "$image"
+  printf '容器内数据目录 : /app/data\n'
+  printf '宿主机数据目录 : %s\n' "$data_dir"
+  printf 'SQLite 数据库  : %s/komari.db\n' "$data_dir"
+  [[ "$image" == *komari-monitor/komari* ]] \
+    || warn "镜像名称不是官方 komari-monitor/komari，请确认这是兼容的自定义镜像。"
+  [[ "$running" == "true" ]] || warn "Komari 容器当前未运行；仍可备份现有落盘数据。"
+  prompt_yes_no confirmed "确认使用以上 Komari 数据目录" 1
+  [[ "$confirmed" -eq 1 ]] || die "用户没有确认 Komari 数据目录。"
+  KOMARI_CONTAINER="$container_name"
+  KOMARI_DATA_DIR="$data_dir"
+  set_komari_paths
+  CURRENT_STEP="检查 Komari Docker 部署"
+  validate_komari_deployment
+  success "Komari 数据目录检查通过：$KOMARI_DATA_DIR"
+}
+
+choose_backup_type_interactive() {
+  local choice default_choice=1
+  [[ "$BACKUP_TYPE" == "komari" ]] && default_choice=2
+  heading "选择要备份的业务"
+  printf '  1) 发卡备份：Dujiao-Next（数据库、上传文件和配置）\n'
+  printf '  2) 探针备份：Komari（Docker /app/data 完整数据）\n'
+  prompt_choice choice "请选择" 1 2 "$default_choice"
+  if [[ "$choice" -eq 1 ]]; then
+    BACKUP_TYPE="dujiao"
+    choose_deployment_interactive
+  else
+    BACKUP_TYPE="komari"
+    choose_komari_interactive
+  fi
+}
+
+configure_current_backup_source_interactive() {
+  case "$BACKUP_TYPE" in
+    dujiao) choose_deployment_interactive ;;
+    komari) choose_komari_interactive ;;
+    *) die "未知备份类型：$BACKUP_TYPE" ;;
+  esac
+}
+
+validate_backup_source() {
+  case "$BACKUP_TYPE" in
+    dujiao) validate_deployment ;;
+    komari) validate_komari_deployment ;;
+    *) die "未知备份类型：$BACKUP_TYPE" ;;
+  esac
 }
 
 install_base_dependencies() {
@@ -675,7 +844,7 @@ prompt_oss_bucket() {
 
 prompt_oss_prefix() {
   local value default_prefix
-  default_prefix="${OSS_PREFIX:-dujiao-next/$(hostname -s)}"
+  default_prefix="${OSS_PREFIX:-server-backups/$(hostname -s)}"
   while true; do
     prompt_text value "OSS 内保存目录（可自定义）" "$default_prefix" 1
     value="$(normalize_oss_prefix "$value")"
@@ -719,7 +888,7 @@ ensure_sftp_key() {
   if [[ ! -f "$SFTP_KEY_FILE" ]]; then
     CURRENT_STEP="生成 SFTP 专用 SSH 密钥"
     rm -f -- "$SFTP_KEY_FILE.pub"
-    ssh-keygen -q -t ed25519 -N '' -C "dujiao-backup@$(hostname -s)" -f "$SFTP_KEY_FILE"
+    ssh-keygen -q -t ed25519 -N '' -C "backup-manager@$(hostname -s)" -f "$SFTP_KEY_FILE"
     success "已生成 SFTP 专用密钥：$SFTP_KEY_FILE"
   elif [[ ! -f "$SFTP_KEY_FILE.pub" ]]; then
     CURRENT_STEP="从 SFTP 私钥恢复公钥"
@@ -768,6 +937,7 @@ sftp_ssh() {
 setup_sftp_authentication() {
   local password
   ensure_sftp_key
+  install -d -o root -g root -m 0700 /root/.ssh
   pin_sftp_host_key
   if sftp_ssh "true" >/dev/null 2>&1; then
     info "现有专用密钥已可登录 SFTP 服务器。"
@@ -827,7 +997,7 @@ prompt_sftp_remote_dir() {
       SFTP_REMOTE_DIR="$value"
       break
     fi
-    warn "请填写专用绝对路径，例如 /root/dujiao-backups，不能含空格或 ..。"
+    warn "请填写专用绝对路径，例如 /root/server-backups，不能含空格或 ..。"
   done
 }
 
@@ -905,7 +1075,7 @@ write_systemd_units() {
   CURRENT_STEP="写入 systemd 定时任务"
   cat > "$SERVICE_FILE" <<SERVICE
 [Unit]
-Description=Dujiao-Next complete backup
+Description=Dujiao-Next or Komari complete backup
 After=docker.service network-online.target
 Wants=network-online.target
 
@@ -922,7 +1092,7 @@ TimeoutStartSec=infinity
 SERVICE
   cat > "$TIMER_FILE" <<TIMER
 [Unit]
-Description=Run Dujiao-Next backup every $(format_interval)
+Description=Run application backup every $(format_interval)
 
 [Timer]
 OnActiveSec=${seconds}s
@@ -1062,7 +1232,7 @@ test_oss_connection() {
   oss_export_environment
   probe="$(mktemp "$TMP_DIR/oss-test.XXXXXX")"
   register_temp "$probe"
-  printf 'Dujiao backup connection test: %s\n' "$(now)" > "$probe"
+  printf 'Backup manager connection test: %s\n' "$(now)" > "$probe"
   name=".dujiao-backup-connection-test"
   uri="$(oss_destination_id)/$name"
   CURRENT_STEP="测试 OSS 上传"
@@ -1107,7 +1277,7 @@ test_sftp_connection() {
   [[ -f "$SFTP_KNOWN_HOSTS" ]] || die "SFTP 主机指纹文件不存在，请重新配置 SFTP。"
   probe="$(mktemp "$TMP_DIR/sftp-test.XXXXXX")"
   register_temp "$probe"
-  printf 'Dujiao backup connection test: %s\n' "$(now)" > "$probe"
+  printf 'Backup manager connection test: %s\n' "$(now)" > "$probe"
   name=".dujiao-backup-test-$(hostname -s)-$$"
   CURRENT_STEP="测试 SFTP 上传"
   sftp_upload_file "$probe" "$name"
@@ -1119,7 +1289,7 @@ test_targets_command() {
   require_root
   ensure_runtime_dirs
   load_config || die "尚未安装或配置。"
-  validate_deployment
+  validate_backup_source
   [[ "$OSS_ENABLED" -eq 0 ]] || test_oss_connection
   [[ "$SFTP_ENABLED" -eq 0 ]] || test_sftp_connection
   if [[ "$OSS_ENABLED" -eq 0 && "$SFTP_ENABLED" -eq 0 ]]; then
@@ -1128,7 +1298,13 @@ test_targets_command() {
 }
 
 valid_archive_name() {
-  [[ "$1" =~ ^dujiao-next-[0-9]{8}-[0-9]{6}[.]tar$ ]]
+  local regex
+  regex="^$(archive_prefix)-[0-9]{8}-[0-9]{6}[.]tar$"
+  [[ "$1" =~ $regex ]]
+}
+
+valid_supported_archive_name() {
+  [[ "$1" =~ ^(dujiao-next|komari)-[0-9]{8}-[0-9]{6}[.]tar$ ]]
 }
 
 archive_marker() {
@@ -1151,7 +1327,7 @@ write_marker() {
   mv -f -- "$temporary" "$marker"
 }
 
-create_archive() {
+create_dujiao_archive() {
   local stamp archive_name archive_path work database_name
   local app_image upload_files database_size partial
   local -a config_items
@@ -1228,6 +1404,85 @@ create_archive() {
   success "本地完整备份已生成：$archive_path（$(stat -c %s "$archive_path") 字节）"
 }
 
+create_komari_archive() {
+  local stamp archive_name archive_path work partial unexpected
+  local app_image database_size data_files
+  CURRENT_STEP="创建 Komari 本地一致性备份"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  archive_name="komari-$stamp.tar"
+  archive_path="$BACKUP_DIR/$archive_name"
+  while [[ -e "$archive_path" ]]; do
+    sleep 1
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    archive_name="komari-$stamp.tar"
+    archive_path="$BACKUP_DIR/$archive_name"
+  done
+  work="$(mktemp -d "$TMP_DIR/backup-$stamp.XXXXXX")"
+  register_temp "$work"
+  install -d -m 0700 "$work/data"
+  partial="$BACKUP_DIR/.$archive_name.partial"
+  ACTIVE_PARTIAL="$partial"
+  info "开始创建 Komari 完整备份：$archive_name"
+
+  unexpected="$(find -P "$KOMARI_DATA_DIR" -xdev ! -type d ! -type f -print -quit)"
+  [[ -z "$unexpected" ]] || die "Komari data 中发现链接或特殊文件，已拒绝打包：$unexpected"
+
+  CURRENT_STEP="复制 Komari data 非数据库文件"
+  tar -C "$KOMARI_DATA_DIR" \
+    --exclude='./komari.db' \
+    --exclude='./komari.db-*' \
+    -cf - -- . | tar -C "$work/data" -xf -
+
+  CURRENT_STEP="创建 Komari SQLite 在线一致性快照"
+  sqlite3 "$KOMARI_DB_FILE" ".timeout 30000" ".backup '$work/data/komari.db'"
+  [[ -s "$work/data/komari.db" ]] || die "Komari SQLite 快照为空。"
+  [[ "$(sqlite3 "$work/data/komari.db" 'PRAGMA quick_check;')" == "ok" ]] \
+    || die "Komari SQLite 快照完整性校验失败。"
+
+  CURRENT_STEP="打包 Komari data 文件夹"
+  tar -C "$work" -czf "$work/data.tar.gz" -- data
+  tar -tzf "$work/data.tar.gz" >/dev/null
+  database_size="$(stat -c %s "$work/data/komari.db")"
+  data_files="$(find "$work/data" -xdev -type f | wc -l | tr -d ' ')"
+  app_image="$(docker inspect --format '{{.Config.Image}}' "$KOMARI_CONTAINER" 2>/dev/null || printf 'unknown')"
+  {
+    printf 'backup_manager_version=%s\n' "$VERSION"
+    printf 'backup_format=1\n'
+    printf 'created_at=%s\n' "$(now)"
+    printf 'hostname=%s\n' "$(hostname)"
+    printf 'application=komari\n'
+    printf 'container_name=%s\n' "$KOMARI_CONTAINER"
+    printf 'container_data_path=/app/data\n'
+    printf 'host_data_path=%s\n' "$KOMARI_DATA_DIR"
+    printf 'database_file=data/komari.db\n'
+    printf 'database_size=%s\n' "$database_size"
+    printf 'data_files=%s\n' "$data_files"
+    printf 'app_image=%s\n' "$app_image"
+  } > "$work/manifest.txt"
+
+  CURRENT_STEP="生成并核对 Komari 备份校验和"
+  (
+    cd "$work"
+    sha256sum data.tar.gz manifest.txt > SHA256SUMS
+    sha256sum -c SHA256SUMS >/dev/null
+  )
+  CURRENT_STEP="生成最终 Komari TAR 备份包"
+  tar -C "$work" -cf "$partial" data.tar.gz manifest.txt SHA256SUMS
+  tar -tf "$partial" >/dev/null
+  chmod 0600 "$partial"
+  mv -f -- "$partial" "$archive_path"
+  ACTIVE_PARTIAL=""
+  success "Komari 本地完整备份已生成：$archive_path（$(stat -c %s "$archive_path") 字节）"
+}
+
+create_archive() {
+  case "$BACKUP_TYPE" in
+    dujiao) create_dujiao_archive ;;
+    komari) create_komari_archive ;;
+    *) die "未知备份类型：$BACKUP_TYPE" ;;
+  esac
+}
+
 sync_archive_to_oss() {
   local archive="$1"
   local name marker destination uri
@@ -1268,7 +1523,7 @@ sync_all_archives() {
   local -a archives
   mapfile -d '' archives < <(
     find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-      -name 'dujiao-next-????????-??????.tar' -print0 | sort -z
+      -name "$(current_archive_pattern)" -print0 | sort -z
   )
   info "本地共有 ${#archives[@]} 个完整备份，开始检查远端同步状态。"
   if [[ "$OSS_ENABLED" -eq 1 ]]; then
@@ -1311,7 +1566,7 @@ delete_sftp_archive() {
 }
 
 parse_archive_names() {
-  grep -oE 'dujiao-next-[0-9]{8}-[0-9]{6}[.]tar$' | sort -u || true
+  grep -oE "$(archive_prefix)-[0-9]{8}-[0-9]{6}[.]tar$" | sort -u || true
 }
 
 archive_array_contains() {
@@ -1332,9 +1587,10 @@ list_oss_archive_names() {
 }
 
 list_sftp_archive_names() {
-  local output
+  local output pattern
   CURRENT_STEP="清点 SFTP 远端备份"
-  output="$(sftp_ssh "for f in '$SFTP_REMOTE_DIR'/dujiao-next-????????-??????.tar; do if test -f \"\$f\"; then basename -- \"\$f\"; fi; done; exit 0")"
+  pattern="$(current_archive_pattern)"
+  output="$(sftp_ssh "for f in '$SFTP_REMOTE_DIR'/$pattern; do if test -f \"\$f\"; then basename -- \"\$f\"; fi; done; exit 0")"
   printf '%s\n' "$output" | parse_archive_names
 }
 
@@ -1343,7 +1599,7 @@ prune_remote_extras() {
   local -a local_archives local_names remote_archives extras filtered
   mapfile -d '' local_archives < <(
     find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-      -name 'dujiao-next-????????-??????.tar' -print0 | sort -z
+      -name "$(current_archive_pattern)" -print0 | sort -z
   )
   for archive in "${local_archives[@]}"; do
     local_names+=("$(basename "$archive")")
@@ -1430,7 +1686,7 @@ apply_retention() {
   local -a archives
   mapfile -d '' archives < <(
     find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-      -name 'dujiao-next-????????-??????.tar' -print0 | sort -z
+      -name "$(current_archive_pattern)" -print0 | sort -z
   )
   oss_destination="$(oss_destination_id)"
   sftp_destination="$(sftp_destination_id)"
@@ -1467,11 +1723,12 @@ backup_command() {
   fi
   start_log_capture
   load_config || die "尚未安装或没有配置文件：$CONFIG_FILE"
-  heading "Dujiao-Next 完整备份开始"
+  heading "$(backup_type_label)完整备份开始"
   info "管理器版本：$VERSION"
-  info "部署模式：$DEPLOY_MODE；最多保留：$MAX_BACKUPS"
+  info "备份类型：$(backup_type_label)；最多保留：$MAX_BACKUPS"
+  [[ "$BACKUP_TYPE" != "dujiao" ]] || info "Dujiao 部署模式：$DEPLOY_MODE"
   CURRENT_STEP="检查备份前环境"
-  validate_deployment
+  validate_backup_source
   create_archive
   sync_all_archives
   apply_retention
@@ -1502,10 +1759,13 @@ validate_inner_tar_paths() {
   local archive="$1"
   local kind="$2"
   local listing member count=0
-  local env_count=0 config_count=0 compose_count=0
+  local env_count=0 config_count=0 compose_count=0 komari_db_count=0
   listing="$(mktemp "$TMP_DIR/tar-list.XXXXXX")"
   register_temp "$listing"
   tar -tzf "$archive" > "$listing"
+  if sort "$listing" | uniq -d | grep -q .; then
+    return 1
+  fi
   while IFS= read -r member; do
     count="$((count + 1))"
     [[ -n "$member" && "$member" != /* && "$member" != "." && "$member" != ./* \
@@ -1524,17 +1784,26 @@ validate_inner_tar_paths() {
           *) return 1 ;;
         esac
         ;;
+      komari-data)
+        [[ "$member" == "data" || "$member" == "data/" || "$member" == data/* ]] || return 1
+        case "$member" in
+          data/komari.db) komari_db_count="$((komari_db_count + 1))" ;;
+          data/komari.db-wal|data/komari.db-shm|data/komari.db-journal) return 1 ;;
+        esac
+        ;;
       *) return 1 ;;
     esac
   done < "$listing"
   if [[ "$kind" == "config" ]]; then
     [[ "$count" -eq 3 && "$env_count" -eq 1 && "$config_count" -eq 1 && "$compose_count" -eq 1 ]]
+  elif [[ "$kind" == "komari-data" ]]; then
+    [[ "$count" -gt 1 && "$komari_db_count" -eq 1 ]]
   else
     [[ "$count" -gt 0 ]]
   fi
 }
 
-verify_archive_file() {
+verify_dujiao_archive_file() {
   local archive="$1"
   local work member database_found=0 database_file=""
   local uploads_found=0 config_found=0 manifest_found=0 checksums_found=0
@@ -1597,31 +1866,114 @@ verify_archive_file() {
   success "备份包完整性校验通过：$archive"
 }
 
+verify_komari_archive_file() {
+  local archive="$1"
+  local work extract_dir member
+  local data_found=0 manifest_found=0 checksums_found=0
+  local expected checksum_name
+  local -a members checksum_files expected_checksum_files
+  [[ -f "$archive" ]] || die "备份文件不存在：$archive"
+  work="$(mktemp -d "$TMP_DIR/verify-komari.XXXXXX")"
+  register_temp "$work"
+  CURRENT_STEP="检查 Komari TAR 目录结构"
+  validate_tar_member_types "$archive" plain "-" || die "Komari 外层 TAR 含有非普通文件条目。"
+  mapfile -t members < <(tar -tf "$archive")
+  [[ "${#members[@]}" -eq 3 ]] || die "Komari 备份包应包含 3 个文件，实际为 ${#members[@]} 个。"
+  for member in "${members[@]}"; do
+    case "$member" in
+      data.tar.gz) data_found="$((data_found + 1))" ;;
+      manifest.txt) manifest_found="$((manifest_found + 1))" ;;
+      SHA256SUMS) checksums_found="$((checksums_found + 1))" ;;
+      *) die "Komari 备份包含异常路径或文件：$member" ;;
+    esac
+  done
+  [[ "$data_found" -eq 1 && "$manifest_found" -eq 1 && "$checksums_found" -eq 1 ]] \
+    || die "Komari 备份包内的固定文件必须各出现一次。"
+  tar --no-same-owner --no-same-permissions -xf "$archive" -C "$work"
+  expected_checksum_files=(data.tar.gz manifest.txt)
+  if grep -Eqv '^[0-9a-fA-F]{64}  [A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
+    die "Komari SHA256SUMS 格式不安全或不受支持。"
+  fi
+  mapfile -t checksum_files < <(awk '{print $2}' "$work/SHA256SUMS")
+  [[ "${#checksum_files[@]}" -eq 2 ]] || die "Komari SHA256SUMS 必须正好包含 2 条记录。"
+  for expected in "${expected_checksum_files[@]}"; do
+    archive_array_contains "$expected" "${checksum_files[@]}" || die "Komari SHA256SUMS 缺少文件：$expected"
+  done
+  for checksum_name in "${checksum_files[@]}"; do
+    archive_array_contains "$checksum_name" "${expected_checksum_files[@]}" || die "Komari SHA256SUMS 含有异常文件：$checksum_name"
+  done
+  CURRENT_STEP="核对 Komari 备份 SHA256"
+  (
+    cd "$work"
+    sha256sum -c SHA256SUMS
+  )
+  grep -qx 'application=komari' "$work/manifest.txt" || die "Komari manifest 缺少正确的 application 标记。"
+  grep -qx 'backup_format=1' "$work/manifest.txt" || die "Komari manifest 版本不受支持。"
+  validate_tar_member_types "$work/data.tar.gz" gzip "-d" || die "Komari data.tar.gz 含有链接或特殊文件。"
+  validate_inner_tar_paths "$work/data.tar.gz" komari-data || die "Komari data.tar.gz 含有不安全路径或数据库旁路文件。"
+  extract_dir="$work/extracted"
+  install -d -m 0700 "$extract_dir"
+  tar --no-same-owner --no-same-permissions -xzf "$work/data.tar.gz" -C "$extract_dir" data/komari.db
+  [[ "$(sqlite3 "$extract_dir/data/komari.db" 'PRAGMA quick_check;')" == "ok" ]] \
+    || die "Komari SQLite 数据库完整性校验失败。"
+  success "Komari SQLite 数据库 quick_check 通过。"
+  success "Komari 备份包完整性校验通过：$archive"
+}
+
+verify_archive_file() {
+  local archive="$1"
+  local name
+  [[ -f "$archive" ]] || die "备份文件不存在：$archive"
+  name="$(basename "$archive")"
+  case "$name" in
+    dujiao-next-*) verify_dujiao_archive_file "$archive" ;;
+    komari-*) verify_komari_archive_file "$archive" ;;
+    *)
+      if tar -tf "$archive" | grep -qx 'data.tar.gz'; then
+        verify_komari_archive_file "$archive"
+      elif tar -tf "$archive" | grep -Eqx 'database[.](sqlite|dump)'; then
+        verify_dujiao_archive_file "$archive"
+      else
+        die "无法根据文件名或包结构识别备份类型：$name"
+      fi
+      ;;
+  esac
+}
+
 verify_command() {
   local archive="${1:-}"
   require_root
   ensure_runtime_dirs
+  load_config || die "尚未安装。"
   if [[ -z "$archive" ]]; then
-    archive="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name 'dujiao-next-????????-??????.tar' -print | sort | tail -n 1)"
+    archive="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$(current_archive_pattern)" -print | sort | tail -n 1)"
   fi
   [[ -n "$archive" ]] || die "本地没有可校验的备份。"
   verify_archive_file "$archive"
 }
 
 list_local_backups() {
-  local count total
+  local count total pattern other_count
   ensure_runtime_dirs
-  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name 'dujiao-next-????????-??????.tar' | wc -l | tr -d ' ')"
+  load_config || die "尚未安装。"
+  pattern="$(current_archive_pattern)"
+  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')"
   total="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
-  heading "本地备份（$count 份，目录占用 ${total:-0}）"
+  heading "$(backup_type_label)本地备份（$count 份，目录占用 ${total:-0}）"
   find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-    -name 'dujiao-next-????????-??????.tar' -printf '%TY-%Tm-%Td %TH:%TM  %10s  %f\n' | sort
+    -name "$pattern" -printf '%TY-%Tm-%Td %TH:%TM  %10s  %f\n' | sort
   [[ "$count" -gt 0 ]] || printf '暂无本地备份。\n'
+  other_count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
+    \( -name 'dujiao-next-????????-??????.tar' -o -name 'komari-????????-??????.tar' \) \
+    ! -name "$pattern" | wc -l | tr -d ' ')"
+  [[ "$other_count" -eq 0 ]] || printf '\n另有 %s 份其他业务类型的历史备份；当前保留策略不会删除它们。\n' "$other_count"
 }
 
 list_remote_backups() {
+  local pattern
   require_root
   load_config || die "尚未安装。"
+  pattern="$(current_archive_pattern)"
   if [[ "$OSS_ENABLED" -eq 1 ]]; then
     heading "阿里云 OSS：$(oss_destination_id)/"
     validate_oss_settings
@@ -1631,7 +1983,7 @@ list_remote_backups() {
   if [[ "$SFTP_ENABLED" -eq 1 ]]; then
     heading "SFTP：$(sftp_destination_id)"
     validate_sftp_settings
-    sftp_ssh "for f in '$SFTP_REMOTE_DIR'/dujiao-next-????????-??????.tar; do test -f \"\$f\" && stat -c '%y  %s  %n' \"\$f\"; done" || true
+    sftp_ssh "for f in '$SFTP_REMOTE_DIR'/$pattern; do test -f \"\$f\" && stat -c '%y  %s  %n' \"\$f\"; done" || true
   fi
   if [[ "$OSS_ENABLED" -eq 0 && "$SFTP_ENABLED" -eq 0 ]]; then
     warn "当前没有启用远端备份。"
@@ -1658,13 +2010,14 @@ timer_status_text() {
 }
 
 status_command() {
-  local count total latest last_result targets=""
+  local count total latest last_result targets="" pattern
   require_root
   ensure_runtime_dirs
   load_config || die "尚未安装。"
-  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name 'dujiao-next-????????-??????.tar' | wc -l | tr -d ' ')"
+  pattern="$(current_archive_pattern)"
+  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')"
   total="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
-  latest="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name 'dujiao-next-????????-??????.tar' -printf '%f\n' | sort | tail -n 1)"
+  latest="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$pattern" -printf '%f\n' | sort | tail -n 1)"
   last_result="$(grep -E '\[(SUCCESS|ERROR)\]' "$LOG_FILE" 2>/dev/null | tail -n 1 || true)"
   [[ "$OSS_ENABLED" -eq 1 ]] && targets="${targets}OSS "
   [[ "$SFTP_ENABLED" -eq 1 ]] && targets="${targets}SFTP "
@@ -1672,8 +2025,15 @@ status_command() {
   heading "$PROGRAM_NAME 状态"
   printf '程序版本      : %s\n' "$VERSION"
   printf '安装目录      : %s\n' "$INSTALL_DIR"
-  printf 'Dujiao 目录   : %s\n' "$APP_DIR"
-  printf '部署模式      : %s\n' "$DEPLOY_MODE"
+  printf '备份类型      : %s\n' "$(backup_type_label)"
+  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
+    printf 'Dujiao 目录   : %s\n' "$APP_DIR"
+    printf '部署模式      : %s\n' "$DEPLOY_MODE"
+  else
+    printf 'Komari 容器   : %s\n' "$KOMARI_CONTAINER"
+    printf 'Komari 数据   : %s -> /app/data\n' "$KOMARI_DATA_DIR"
+    printf 'Komari 数据库 : %s\n' "$KOMARI_DB_FILE"
+  fi
   printf '备份目标      : %s\n' "$targets"
   printf '最多保留      : %s 份\n' "$MAX_BACKUPS"
   printf '本地备份      : %s 份，占用 %s\n' "$count" "${total:-0}"
@@ -1695,7 +2055,11 @@ status_command() {
 
 show_logs() {
   ensure_runtime_dirs
-  heading "最近 100 行日志：$LOG_FILE"
+  if load_config >/dev/null 2>&1; then
+    heading "$(backup_type_label)最近 100 行日志：$LOG_FILE"
+  else
+    heading "最近 100 行日志：$LOG_FILE"
+  fi
   tail -n 100 "$LOG_FILE"
 }
 
@@ -1772,9 +2136,17 @@ show_configuration_summary() {
   [[ -f "$CONFIG_FILE" ]] && config_mode="$(stat -c '%U:%G %a' "$CONFIG_FILE" 2>/dev/null || printf '未知')"
   heading "当前配置摘要（敏感信息已脱敏）"
   printf '配置文件           : %s（%s）\n' "$CONFIG_FILE" "$config_mode"
-  printf 'Dujiao 目录        : %s\n' "$APP_DIR"
-  printf '部署模式           : %s\n' "$DEPLOY_MODE"
-  [[ "$DEPLOY_MODE" == "postgres" ]] && printf 'PostgreSQL 容器    : %s\n' "$PG_CONTAINER"
+  printf '备份类型           : %s\n' "$(backup_type_label)"
+  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
+    printf 'Dujiao 目录        : %s\n' "$APP_DIR"
+    printf '部署模式           : %s\n' "$DEPLOY_MODE"
+    [[ "$DEPLOY_MODE" == "postgres" ]] && printf 'PostgreSQL 容器    : %s\n' "$PG_CONTAINER"
+  else
+    printf 'Komari 容器        : %s\n' "$KOMARI_CONTAINER"
+    printf 'Komari 宿主机目录  : %s\n' "$KOMARI_DATA_DIR"
+    printf 'Komari 容器内目录  : /app/data\n'
+    printf 'Komari SQLite      : %s\n' "$KOMARI_DB_FILE"
+  fi
   printf '最多保留           : %s 份\n' "$MAX_BACKUPS"
   printf '\nOSS 状态           : %s\n' "$(enabled_status_text "$OSS_ENABLED")"
   printf 'OSS AccessKey ID   : %s\n' "$(mask_access_key "$OSS_ACCESS_KEY_ID")"
@@ -2028,11 +2400,54 @@ sftp_configuration_menu() {
   done
 }
 
+backup_source_configuration_menu() {
+  local choice previous_type
+  while true; do
+    load_config || die "尚未安装。"
+    heading "发卡 / 探针备份设置"
+    printf '当前类型：%s\n' "$(backup_type_label)"
+    if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
+      printf '当前数据：%s（%s）\n\n' "$APP_DIR" "$DEPLOY_MODE"
+    else
+      printf '当前数据：%s -> %s:/app/data\n\n' "$KOMARI_DATA_DIR" "$KOMARI_CONTAINER"
+    fi
+    printf '  1) 修改当前业务的数据源设置\n'
+    printf '  2) 选择/切换发卡备份或探针备份\n'
+    printf '  3) 检查当前数据源和 Docker 挂载\n'
+    printf '  4) 查看完整配置摘要（脱敏）\n'
+    printf '  0) 返回统一配置中心\n'
+    prompt_choice choice "请选择" 0 4 0
+    case "$choice" in
+      1)
+        configure_current_backup_source_interactive
+        save_config
+        success "$(backup_type_label)数据源设置已保存。"
+        ;;
+      2)
+        previous_type="$BACKUP_TYPE"
+        choose_backup_type_interactive
+        save_config
+        success "备份类型已保存为：$(backup_type_label)"
+        if [[ "$previous_type" != "$BACKUP_TYPE" ]]; then
+          warn "原业务的本地和远端备份会保留；当前保留策略只管理新选择的业务类型。"
+        fi
+        ;;
+      3)
+        validate_backup_source
+        success "$(backup_type_label)数据源检查通过。"
+        ;;
+      4) show_configuration_summary ;;
+      0) return 0 ;;
+    esac
+    pause_for_enter
+  done
+}
+
 complete_configuration_wizard() {
   local change_timer timer_enabled
-  choose_deployment_interactive
-  configure_retention_interactive
   configure_targets_interactive
+  choose_backup_type_interactive
+  configure_retention_interactive
   save_config
   test_targets_command
   prompt_yes_no change_timer "是否同时修改内置定时任务" 1
@@ -2052,11 +2467,11 @@ configuration_menu() {
   while true; do
     load_config || die "尚未安装。"
     heading "统一配置中心"
-    printf '部署：%s  |  保留：%s份  |  OSS：%s  |  SFTP：%s  |  定时：%s\n\n' \
-      "$DEPLOY_MODE" "$MAX_BACKUPS" "$(enabled_status_text "$OSS_ENABLED")" \
+    printf '业务：%s  |  保留：%s份  |  OSS：%s  |  SFTP：%s  |  定时：%s\n\n' \
+      "$(backup_type_label)" "$MAX_BACKUPS" "$(enabled_status_text "$OSS_ENABLED")" \
       "$(enabled_status_text "$SFTP_ENABLED")" "$(timer_status_text)"
     printf '  1) 查看全部配置摘要（脱敏）\n'
-    printf '  2) 修改 Dujiao 部署目录/模式\n'
+    printf '  2) 管理发卡/探针备份类型和数据源\n'
     printf '  3) 修改备份保留数量\n'
     printf '  4) 管理阿里云 OSS 全部参数\n'
     printf '  5) 管理 SFTP/SSH 全部参数\n'
@@ -2067,11 +2482,7 @@ configuration_menu() {
     prompt_choice choice "请选择" 0 8 0
     case "$choice" in
       1) show_configuration_summary ;;
-      2)
-        choose_deployment_interactive
-        save_config
-        success "部署配置已保存。"
-        ;;
+      2) backup_source_configuration_menu; continue ;;
       3)
         configure_retention_interactive
         save_config
@@ -2159,16 +2570,18 @@ menu() {
   require_tty
   load_config || die "尚未完成安装，请先运行：bash dujiao-backup.sh install"
   while true; do
+    load_config || die "配置文件读取失败：$CONFIG_FILE"
     heading "$PROGRAM_NAME v$VERSION"
-    printf '  1) 立即执行完整备份\n'
+    printf '当前业务：%s\n\n' "$(backup_type_label)"
+    printf '  1) 立即执行当前业务完整备份\n'
     printf '  2) 查看运行状态\n'
-    printf '  3) 统一配置中心（部署/OSS/SFTP/定时等）\n'
+    printf '  3) 统一配置中心（发卡/探针/OSS/SFTP/定时）\n'
     printf '  4) 定时任务快捷管理\n'
     printf '  5) 查看本地备份\n'
     printf '  6) 查看远端备份\n'
     printf '  7) 校验备份包\n'
     printf '  8) 测试远端连接\n'
-    printf '  9) 查看最近日志\n'
+    printf '  9) 查看当前业务最近日志\n'
     printf ' 10) 检查并执行在线升级\n'
     printf ' 11) 显示宝塔计划任务命令\n'
     printf ' 12) 卸载管理器\n'
@@ -2254,13 +2667,13 @@ install_command() {
   fi
   if [[ "$keep_existing" -eq 0 ]]; then
     set_config_defaults
-    choose_deployment_interactive
-    configure_retention_interactive
     configure_targets_interactive
+    choose_backup_type_interactive
+    configure_retention_interactive
     save_config
     configure_timer_during_install
   else
-    validate_deployment
+    validate_backup_source
     [[ "$OSS_ENABLED" -eq 0 ]] || install_ossutil
     restore_timer_after_install
   fi
@@ -2288,6 +2701,7 @@ configure_command() {
 
 self_test() {
   local result
+  BACKUP_TYPE="dujiao"
   DEPLOY_MODE="sqlite"
   APP_DIR="/opt/dujiao-next"
   set_deployment_paths
@@ -2301,8 +2715,19 @@ self_test() {
   [[ "$result" == "dujiao-next/test" ]]
   result="$(normalize_oss_prefix '///dujiao-next/test///')"
   [[ "$result" == "dujiao-next/test" ]]
+  [[ "$(backup_type_label)" == "发卡备份（Dujiao-Next）" ]]
+  [[ "$(current_archive_pattern)" == "dujiao-next-????????-??????.tar" ]]
   valid_archive_name "dujiao-next-20260815-123456.tar"
   if valid_archive_name "dujiao-next-20260815-123456.tar.bad"; then return 1; fi
+  valid_supported_archive_name "komari-20260815-123456.tar"
+  BACKUP_TYPE="komari"
+  KOMARI_DATA_DIR="/komari/data"
+  set_komari_paths
+  [[ "$KOMARI_DB_FILE" == "/komari/data/komari.db" ]]
+  [[ "$(backup_type_label)" == "探针备份（Komari）" ]]
+  [[ "$(current_archive_pattern)" == "komari-????????-??????.tar" ]]
+  valid_archive_name "komari-20260815-123456.tar"
+  if valid_archive_name "dujiao-next-20260815-123456.tar"; then return 1; fi
   TIMER_DAYS=0
   TIMER_HOURS=0
   TIMER_MINUTES=2
@@ -2313,10 +2738,10 @@ self_test() {
   validate_uint_between "8" 0 23
   if validate_uint_between "08" 0 23; then return 1; fi
   result="$(printf '%s\n' \
-    'oss://bucket/prefix/dujiao-next-20260815-123457.tar' \
+    'oss://bucket/prefix/komari-20260815-123457.tar' \
     'summary line' \
-    'oss://bucket/prefix/dujiao-next-20260815-123456.tar' | parse_archive_names)"
-  [[ "$result" == $'dujiao-next-20260815-123456.tar\ndujiao-next-20260815-123457.tar' ]]
+    'oss://bucket/prefix/komari-20260815-123456.tar' | parse_archive_names)"
+  [[ "$result" == $'komari-20260815-123456.tar\nkomari-20260815-123457.tar' ]]
   archive_array_contains "b" "a" "b" "c"
   if archive_array_contains "x" "a" "b" "c"; then return 1; fi
   result="$(printf '%s\n' '{' '  "Content-Length": "123",' '  "X-Oss-Meta-Dujiao-Sha256": "abc"' '}' | json_string_field 'Content-Length')"
@@ -2327,6 +2752,8 @@ self_test() {
 show_help() {
   cat <<HELP
 $PROGRAM_NAME v$VERSION
+
+支持发卡备份（Dujiao-Next）与探针备份（Komari Docker data）。
 
 用法：
   bash dujiao-backup.sh install    交互式安装

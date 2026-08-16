@@ -15,13 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Bash syntax
-        run: bash -n dujiao-backup.sh tests/fake-ossutil tests/integration-oss.sh tests/integration-sftp.sh
+        run: bash -n dujiao-backup.sh tests/fake-ossutil tests/integration-komari.sh tests/integration-oss.sh tests/integration-sftp.sh
       - name: ShellCheck
-        run: shellcheck -S warning -x dujiao-backup.sh tests/fake-ossutil tests/integration-oss.sh tests/integration-sftp.sh
+        run: shellcheck -S warning -x dujiao-backup.sh tests/fake-ossutil tests/integration-komari.sh tests/integration-oss.sh tests/integration-sftp.sh
       - name: Built-in self test
         run: bash dujiao-backup.sh self-test
       - name: Version contract
-        run: test "$(bash dujiao-backup.sh version)" = "1.1.5"
+        run: test "$(bash dujiao-backup.sh version)" = "1.2.0"
 
   debian:
     runs-on: ubuntu-latest
@@ -169,6 +169,15 @@ jobs:
           docker exec -i "$container" pg_restore -U dujiao -d restore_test \
             < /tmp/dujiao-restore-check/database.dump
           test "$(docker exec "$container" psql -U dujiao -d restore_test -Atc 'SELECT count(*) FROM products')" = "1"
+
+  komari-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install SQLite
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 util-linux
+      - name: Back up a live Komari WAL database and enforce retention
+        run: sudo env DUJIAO_INTEGRATION_TEST=1 bash tests/integration-komari.sh
 
   oss-integration:
     runs-on: ubuntu-latest
