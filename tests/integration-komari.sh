@@ -62,6 +62,13 @@ printf '%s\n' \
   'exit 0' > "$fake_bin/apt-get"
 chmod 0755 "$fake_bin/apt-get"
 
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -Eeuo pipefail' \
+  'sleep 1' \
+  'exec /usr/bin/tee "$@"' > "$fake_bin/tee"
+chmod 0755 "$fake_bin/tee"
+
 export PATH="$fake_bin:$PATH"
 export FAKE_KOMARI_DATA_DIR="$data_dir"
 printf '%s\n' \
@@ -90,14 +97,14 @@ printf '%s\n' \
     -- bash "$repo_dir/dujiao-backup.sh" install
 tr -d '\r' < "$install_transcript" > "$install_output"
 
-grep -Fq '安装 Dujiao-Next / Komari Backup Manager v1.2.1' "$install_output"
+grep -Fq '安装 Dujiao-Next / Komari Backup Manager v1.2.2' "$install_output"
 grep -Fq '选择备份目标' "$install_output"
 grep -Fq '选择要备份的业务' "$install_output"
 grep -Fq '识别 Komari 探针面板 Docker 部署' "$install_output"
 grep -Fq '设置备份保留数量' "$install_output"
 grep -Fq '配置自动备份' "$install_output"
 grep -Fq '安装成功' "$install_output"
-install_line="$(awk 'index($0, "安装 Dujiao-Next / Komari Backup Manager v1.2.1") { print NR; exit }' "$install_output")"
+install_line="$(awk 'index($0, "安装 Dujiao-Next / Komari Backup Manager v1.2.2") { print NR; exit }' "$install_output")"
 target_line="$(awk 'index($0, "选择备份目标") { print NR; exit }' "$install_output")"
 business_line="$(awk 'index($0, "选择要备份的业务") { print NR; exit }' "$install_output")"
 komari_line="$(awk 'index($0, "识别 Komari 探针面板 Docker 部署") { print NR; exit }' "$install_output")"
@@ -152,6 +159,7 @@ test -f "$data_dir/komari.db-wal"
 test -f "$data_dir/komari.db-shm"
 
 run_backup
+grep -Fq '本次完整备份全部成功。' /opt/dujiao-backup/logs/dujiao-backup.log
 first_archive="$(find /opt/dujiao-backup/backups -maxdepth 1 -name 'komari-*.tar' -print -quit)"
 test -n "$first_archive"
 tar -xf "$first_archive" -C "$restore_dir"

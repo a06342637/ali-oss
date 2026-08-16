@@ -23,7 +23,7 @@ jobs:
       - name: Built-in self test
         run: bash dujiao-backup.sh self-test
       - name: Version contract
-        run: test "$(bash dujiao-backup.sh version)" = "1.2.1"
+        run: test "$(bash dujiao-backup.sh version)" = "1.2.2"
 
   debian:
     runs-on: ubuntu-latest

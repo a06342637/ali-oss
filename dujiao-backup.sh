@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROGRAM_NAME="Dujiao-Next / Komari Backup Manager"
-readonly VERSION="1.2.1"
+readonly VERSION="1.2.2"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -26,6 +26,7 @@ readonly LOG_ROTATIONS="5"
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 CURRENT_STEP="启动程序"
 LOG_CAPTURED=0
+LOG_CAPTURE_PID=""
 ERROR_HANDLED=0
 ACTIVE_PARTIAL=""
 declare -a TEMP_PATHS=()
@@ -111,6 +112,20 @@ on_error() {
   exit "$rc"
 }
 
+finish_log_capture() {
+  local capture_pid="${LOG_CAPTURE_PID:-}"
+  [[ "$LOG_CAPTURED" -eq 1 ]] || return 0
+  # 先恢复并关闭写入日志管道的描述符，再等待 tee 排空全部内容。
+  # 这样子命令返回主菜单前，最后一条日志一定已经显示并写入磁盘。
+  exec 1>&6 2>&7
+  exec 6>&- 7>&-
+  LOG_CAPTURED=0
+  LOG_CAPTURE_PID=""
+  if [[ -n "$capture_pid" ]]; then
+    wait "$capture_pid" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
   local path
   set +e
@@ -122,6 +137,7 @@ cleanup() {
       "$TMP_DIR"/*|/tmp/dujiao-backup-*) rm -rf -- "$path" ;;
     esac
   done
+  finish_log_capture
 }
 
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
@@ -180,8 +196,11 @@ start_log_capture() {
     return 0
   fi
   [[ "$mode" == "full" ]] || die "未知日志捕获模式：$mode"
+  exec 6>&1 7>&2
   exec > >(tee -a "$LOG_FILE") 2>&1
+  LOG_CAPTURE_PID="$!"
   LOG_CAPTURED=1
+  [[ "$LOG_CAPTURE_PID" =~ ^[0-9]+$ ]] || die "无法启动日志同步进程。"
 }
 
 pause_for_enter() {

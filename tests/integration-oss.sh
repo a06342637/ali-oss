@@ -150,6 +150,10 @@ if grep -E '(AccessKey|Region ID|公网 Endpoint|Bucket 名称|OSS 内保存目�
   printf 'OSS configuration prompt and log output were joined on one line.\n' >&2
   exit 1
 fi
+if grep -Fq 'test-secret-2' "$menu_output"; then
+  printf 'AccessKey Secret was unexpectedly echoed by the interactive terminal.\n' >&2
+  exit 1
+fi
 (
   # shellcheck disable=SC1091
   source /opt/dujiao-backup/config.conf
