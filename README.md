@@ -1,21 +1,62 @@
-# Dujiao-Next / Komari Backup Manager
+# Server Backup Manager
 
-面向 Debian/Ubuntu Docker 服务器的交互式完整备份管理器，同时支持：
+[![Release](https://img.shields.io/github/v/release/a06342637/ali-oss?display_name=tag&sort=semver)](https://github.com/a06342637/ali-oss/releases/latest)
+[![Tests](https://github.com/a06342637/ali-oss/actions/workflows/test.yml/badge.svg)](https://github.com/a06342637/ali-oss/actions/workflows/test.yml)
+[![License](https://img.shields.io/github/license/a06342637/ali-oss)](LICENSE)
 
-- 发卡备份：Dujiao-Next 官方 Docker Compose 部署
-- 探针备份：Komari 官方 Docker 部署
-- 阿里云 OSS、SFTP/SSH、双远端或仅本地备份
-- 本地及远端按数量保留、缺失备份自动补传
-- systemd 间隔定时和宝塔计划任务
-- 配置查看与修改、连接测试、日志、完整性校验、在线升级和安全卸载
+> Dujiao-Next、Komari、自定义目录和 MySQL/MariaDB 的统一备份方案；支持本地归档、阿里云 OSS、SFTP/SSH 双远端、定时任务、完整性校验和备份历史。
 
-当前版本：`v1.2.2`
+面向 Debian / Ubuntu 服务器的专业交互式备份管理器。一个脚本统一管理数据源、本地归档、远端同步、保留策略、定时任务、完整性校验和执行历史。当前仍是“一个活动任务配置”，可随时在四种类型之间切换。
 
-> 为兼容已经安装的旧版本，命令和管理目录仍使用 `dujiao-backup` 名称。升级不会覆盖现有配置、密钥、日志或备份。
+当前版本：`v1.3.0`
+
+## 功能概览
+
+### 备份任务类型
+
+1. **发卡备份（Dujiao-Next）**
+   - SQLite + Redis 官方 Compose 方案
+   - PostgreSQL + Redis 官方 Compose 方案
+   - 数据库、上传文件与关键配置完整归档
+2. **探针备份（Komari）**
+   - 自动识别 Docker 容器 `/app/data` 的宿主机挂载
+   - SQLite Online Backup，一致处理 WAL 数据库
+   - 完整归档主题和其他 data 文件
+3. **自定义目录备份**
+   - 自定义任务名称和任意绝对目录
+   - 支持目录路径包含空格
+   - 归档前检查真实路径、递归风险、可读性和文件类型
+4. **MySQL / MariaDB 数据库备份**
+   - 自动扫描本机客户端、安装包、systemd 服务和 Docker 数据库容器
+   - 支持宿主机 TCP、Unix Socket、远程 MySQL、Docker 容器内本地连接
+   - 支持指定数据库、全部业务数据库或全实例备份
+
+### 存储目标
+
+- 本地安全归档（始终生成）
+- 阿里云 OSS
+- SFTP / SSH
+- OSS + SFTP 双远端
+- 仅本地（不推荐作为唯一副本）
+
+所有任务复用同一条可靠链路：
+
+```text
+检查数据源
+  -> 创建一致性归档
+  -> 生成 SHA256SUMS
+  -> 校验本地包
+  -> 上传 OSS/SFTP
+  -> 核对远端大小与 SHA256
+  -> 执行保留策略
+  -> 写入结构化历史
+```
+
+> 为兼容旧安装，命令、安装目录和 systemd 单元仍使用 `dujiao-backup` 名称。升级不会覆盖配置、SSH 密钥、日志或已有归档。
 
 ## 一键安装
 
-使用 `root` 登录服务器后运行：
+使用 `root` 登录服务器：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh \
@@ -23,23 +64,199 @@ curl -fsSL https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backu
 bash /tmp/dujiao-backup.sh install
 ```
 
-新安装向导按以下顺序进行：
+新安装向导会依次完成：
 
-1. 选择阿里云 OSS、SFTP、双远端或仅本地备份
-2. 完成对应 OSS/SFTP 参数和连接认证
-3. 选择“发卡备份”或“探针备份”
-4. 自动识别并确认对应 Docker 数据源
-5. 设置备份保留数量
-6. 设置 systemd 定时任务
+1. 选择 OSS、SFTP、双远端或仅本地
+2. 配置并测试远端连接
+3. 选择四种备份任务之一
+4. 自动识别或交互配置数据源
+5. 设置当前任务类型的保留数量
+6. 配置 systemd 定时任务
 7. 可选立即生成第一份备份
 
-所有配置项、菜单选择和确认项都必须显式输入。直接回车、只输入空格或 Tab 都不会采用参考值，也不会进入下一步；脚本会原地提示并等待重新输入。参考值只用于帮助填写。仅“按回车继续”和“备份文件留空时校验最新一份”这类明确标注的非配置操作允许留空。
+为避免误用参考值，重要配置项必须明确输入。密码输入不会回显。
 
-`v1.2.2` 统一了交互界面的输出通道，并会在备份子命令退出前等待日志完全刷新。安装、OSS/SFTP 配置、业务选择、保留数量、定时设置、立即备份和各级菜单都会按顺序同步显示，避免下载、连接或备份日志延迟插入下一条提示而造成标题缺失、选项错位、文字粘连或最后一行遗漏。
+## 管理菜单
 
-## 两种业务备份
+安装后执行：
 
-### 发卡备份：Dujiao-Next
+```bash
+dujiao-backup
+```
+
+主菜单：
+
+```text
+  1) 立即执行当前备份任务
+  2) 查看当前备份任务（数据源/目标/计划/最近结果）
+  3) 统一配置中心（任务类型/目录/MySQL/OSS/SFTP/定时）
+  4) 定时任务快捷管理
+  5) 查看备份历史（执行记录 + 全部本地归档）
+  6) 查看远端归档历史（OSS/SFTP）
+  7) 校验备份包
+  8) 测试远端连接
+  9) 查看最近 100 行运行日志
+ 10) 检查并执行在线升级
+ 11) 显示宝塔计划任务命令
+ 12) 卸载管理器
+  0) 退出
+```
+
+统一配置中心支持随时修改：
+
+- 当前任务类型及其数据源
+- 自定义目录任务名称和源目录
+- MySQL 连接方式、容器、地址、端口、Socket、用户、密码和备份范围
+- 保留数量
+- OSS 全部参数和版本控制删除策略
+- SFTP 主机、端口、用户、目录、主机指纹和专用密钥
+- systemd 定时间隔
+
+系统当前采用**单个当前任务**模型。切换任务类型不会删除原任务归档；保留策略只清理当前任务类型的标准文件名，历史页面会集中显示四种类型的所有归档。
+
+## 自定义目录备份
+
+在“统一配置中心 -> 管理备份任务类型和数据源”中选择：
+
+```text
+3) 自定义目录
+```
+
+需要输入：
+
+- 任务名称，例如 `商城附件`
+- 源目录绝对路径，例如 `/var/www/shop storage`
+
+每份 `directory-YYYYMMDD-HHMMSS.tar` 包含：
+
+```text
+directory.tar.gz
+manifest.txt
+SHA256SUMS
+```
+
+`directory.tar.gz` 内是源目录中的完整相对目录树。`manifest.txt` 记录任务名称、原始目录、主机、时间、文件数量和源数据大小。
+
+### 目录安全策略
+
+脚本会拒绝：
+
+- `/` 根目录
+- 含 `..` 的非规范路径
+- 备份输出目录及会包含输出目录的父目录，防止递归归档
+- 源目录本身为符号链接
+- 目录中的符号链接、设备文件、FIFO、Socket 等特殊文件
+- 不可读文件
+
+该策略让归档可以做严格的类型和路径校验。若业务目录确实依赖符号链接，应改为备份链接指向的真实数据目录。
+
+目录备份属于文件级快照。高频写入应用应在备份窗口暂停写入，或先创建 LVM/ZFS/Btrfs/云盘快照，再将快照挂载目录配置为数据源。
+
+### 恢复目录备份
+
+```bash
+mkdir -p /root/restore-directory
+cd /root/restore-directory
+tar -xf /opt/dujiao-backup/backups/directory-YYYYMMDD-HHMMSS.tar
+tar -xzf directory.tar.gz
+```
+
+恢复前建议先运行：
+
+```bash
+dujiao-backup verify /opt/dujiao-backup/backups/directory-YYYYMMDD-HHMMSS.tar
+```
+
+## MySQL / MariaDB 备份
+
+在任务类型中选择：
+
+```text
+4) MySQL 数据库
+```
+
+### 自动扫描
+
+配置向导会显示：
+
+- 宿主机上的 `mysql` / `mariadb` 查询客户端
+- `mysqldump` / `mariadb-dump` 导出工具
+- 已运行的 `mysql`、`mariadb`、`mysqld` systemd 服务
+- 已安装的 MySQL、MariaDB、Percona 软件包
+- 运行中的 MySQL、MariaDB、Percona Docker 容器
+
+如果选择宿主机或远程连接但客户端缺失，向导可使用 `apt-get` 自动安装 `default-mysql-client`，并在必要时回退到 `mariadb-client`。
+
+### 连接模式
+
+1. **宿主机 TCP**
+   - 本机监听地址
+   - 远程 MySQL / MariaDB
+2. **宿主机 Unix Socket**
+   - 自动探测常见 Socket 路径
+3. **Docker 容器内本地连接**
+   - 自动识别常见数据库镜像
+   - 在容器内通过本地 Socket 执行客户端
+
+### 数据库范围
+
+- **指定数据库**：英文逗号分隔，例如 `shop,analytics`
+- **全部业务数据库**：运行时自动发现，并排除：
+  - `information_schema`
+  - `performance_schema`
+  - `mysql`
+  - `sys`
+- **全实例**：包括 `mysql`/`sys` 与账户权限数据（虚拟库由服务端生成），需要较高权限
+
+每份 `mysql-YYYYMMDD-HHMMSS.tar` 包含：
+
+```text
+database.sql.gz
+manifest.txt
+SHA256SUMS
+```
+
+导出默认使用：
+
+```text
+--single-transaction
+--quick
+--routines
+--events
+--triggers
+--hex-blob
+--default-character-set=utf8mb4
+```
+
+这会为 InnoDB 表创建不停机一致性逻辑备份，并包含存储过程、事件和触发器。MyISAM 等非事务表无法获得与 InnoDB 相同的事务快照保证；这类数据库建议在备份窗口锁定写入或使用物理快照方案。
+
+### MySQL 权限建议
+
+备份账号至少需要所选数据库的读取和视图权限，并按实际对象授予事件、触发器和存储过程相关权限。全实例备份还需要读取系统对象所需权限。
+
+建议创建专用最小权限账号，不要长期使用业务应用账号。脚本不会把密码放入命令行；运行时使用权限为 `0600` 的临时 `defaults-extra-file`，Docker 模式通过标准输入送入容器内临时文件，退出即删除。
+
+MySQL 密码保存在：
+
+```text
+/opt/dujiao-backup/config.conf
+```
+
+该文件会强制设置为 `root:root 0600`，菜单和日志只显示“已保存”，不会回显密码。
+
+### 恢复 MySQL 备份
+
+```bash
+mkdir -p /root/restore-mysql
+tar -xf /opt/dujiao-backup/backups/mysql-YYYYMMDD-HHMMSS.tar \
+  -C /root/restore-mysql
+gzip -cd /root/restore-mysql/database.sql.gz \
+  | mysql --user=root --password
+```
+
+请先在隔离实例验证恢复，再用于生产环境。
+
+## Dujiao-Next 发卡备份
 
 支持官方 Docker Compose：
 
@@ -56,43 +273,11 @@ manifest.txt
 SHA256SUMS
 ```
 
-SQLite 使用在线一致性快照；PostgreSQL 使用 custom-format `pg_dump`。Redis 只作为缓存和队列，不包含在业务备份中。
+SQLite 使用 Online Backup；PostgreSQL 使用 custom-format `pg_dump` 并通过 `pg_restore --list` 校验。Redis 仅作为缓存和队列，不包含在业务备份中。
 
-### 探针备份：Komari
+## Komari 探针备份
 
-Komari 官方 Docker 文档把宿主机 `data` 文件夹挂载到容器 `/app/data`：
-
-```yaml
-volumes:
-  - ./data:/app/data
-```
-
-参考：[Komari Docker 部署文档](https://komari-document.pages.dev/install/docker)
-
-脚本不会猜测宿主机路径，而是通过 Docker Inspect 查找容器 `/app/data` 的真实 Mount Source，再要求人工确认。例如：
-
-```text
-宿主机 /komari/data  ->  容器 /app/data
-```
-
-配置保存后，每次备份都会再次核对挂载。如果容器名称或挂载路径发生变化，任务会停止并提示重新识别，防止备份错误目录。
-
-Komari 默认数据库是 SQLite，运行时通常存在：
-
-```text
-komari.db
-komari.db-wal
-komari.db-shm
-theme/
-```
-
-不能简单压缩一个正在写入的 WAL 数据库。脚本采用以下方式实现不停机一致性备份：
-
-1. 复制 `data` 内除 SQLite 主库和运行时旁路文件之外的普通文件
-2. 使用 SQLite Online Backup 创建一致的 `komari.db` 快照
-3. 对快照执行 `PRAGMA quick_check`
-4. 重新组成完整 `data` 文件夹并打包
-5. 生成 SHA256 清单并再次校验
+脚本通过 Docker Inspect 查找容器 `/app/data` 的唯一宿主机 Mount Source，并在每次备份前复核挂载关系，避免容器重建后误备份旧目录。
 
 每份 `komari-YYYYMMDD-HHMMSS.tar` 包含：
 
@@ -102,213 +287,214 @@ manifest.txt
 SHA256SUMS
 ```
 
-其中 `data.tar.gz` 内是可用于恢复的完整 `data/` 目录，包含一致的 `data/komari.db`，不包含运行时 `-wal`、`-shm` 或 `-journal` 文件。
+对于 WAL 模式 SQLite，脚本会：
+
+1. 复制除 `komari.db` 及 `-wal`、`-shm`、`-journal` 外的普通文件
+2. 使用 SQLite Online Backup 生成一致的 `komari.db`
+3. 执行 `PRAGMA quick_check`
+4. 重新打包完整 `data/` 目录
 
 ## 阿里云 OSS
 
-安装向导会询问：
+配置项：
 
-- AccessKey ID
-- AccessKey Secret
+- AccessKey ID / Secret
 - Region ID，例如 `cn-hangzhou`
 - Endpoint，例如 `oss-cn-hangzhou.aliyuncs.com`
-- Bucket 名称
-- Bucket 内保存目录，例如 `server-backups/node-01`
+- Bucket
+- Bucket 内保存目录
 - Bucket 是否开启版本控制
-- 是否永久删除超出保留数对象的全部历史版本
+- 超出保留数时是否永久删除对象全部历史版本
 
-AccessKey 保存在 `/opt/dujiao-backup/config.conf`，权限固定为 `0600`，不会出现在 systemd 或宝塔命令中。建议使用最小权限的 RAM 用户，不要使用阿里云主账号 AccessKey。
+上传后脚本会核对：
 
-如果 Bucket 开启版本控制，普通删除只会生成 DeleteMarker。若不选择永久删除全部历史版本，请在 OSS 控制台设置历史版本和过期删除标记的生命周期规则。
+- OSS 对象大小
+- `X-Oss-Meta-Dujiao-Sha256` 元数据
 
-## SFTP/SSH
+AccessKey 不会进入 systemd 单元或宝塔命令。建议使用最小权限 RAM 用户。
 
-安装向导会询问：
+如果 Bucket 启用版本控制但未选择“永久删除全部历史版本”，请在 OSS 控制台配置历史版本和 DeleteMarker 生命周期规则。
 
-- 远端 IP 或域名
+## SFTP / SSH
+
+配置项：
+
+- 主机名或 IP
 - SSH/SFTP 端口
-- SSH 用户名
-- 首次登录密码
-- 远端保存目录，例如 `/root/server-backups`
+- 用户名
+- 首次授权密码
+- 远端专用保存目录
 
-密码只用于首次下发专用 Ed25519 公钥，不写入配置、日志或计划任务。首次连接必须人工核对 SSH 主机指纹。
+脚本会生成专用 Ed25519 密钥。密码只用于首次安装公钥，不保存；首次连接需确认主机指纹，后续固定使用 `known_hosts`。
 
-上传流程：
+上传流程使用：
 
-1. 上传为 `.partial` 临时文件
-2. 在远端计算并比对 SHA256
-3. 校验成功后原子改名为正式 `.tar`
+1. `.partial` 临时文件
+2. 远端直接计算 SHA256
+3. 与本地 SHA256 比较
+4. 原子改名为最终归档名
 
-因此未完成的上传不会被误认为有效备份。
+## 备份历史与任务展示
 
-## 管理菜单
-
-运行：
-
-```bash
-dujiao-backup
-```
-
-主菜单提供：
-
-1. 立即执行当前业务完整备份
-2. 查看运行状态和当前发卡/探针数据源
-3. 统一配置中心
-4. 定时任务快捷管理
-5. 查看本地备份
-6. 查看远端备份
-7. 校验备份包
-8. 测试远端连接
-9. 查看当前业务最近日志
-10. 在线升级
-11. 显示宝塔计划任务命令
-12. 安全卸载
-
-“统一配置中心”可以查看脱敏配置，并分别管理：
-
-- 发卡备份 / 探针备份类型切换
-- Dujiao 目录、数据库模式和 PostgreSQL 容器
-- Komari 容器和 `/app/data` 实际挂载
-- 本地与远端保留数量
-- OSS 全部参数和版本控制策略
-- SFTP 全部参数、主机指纹和密钥认证
-- systemd 定时间隔与启停
-
-切换业务类型不会删除原业务已有的本地或远端备份。当前保留策略只管理当前业务前缀，避免把另一类历史备份误删。
-
-## 常用命令
+### 当前任务
 
 ```bash
-dujiao-backup backup
 dujiao-backup status
-dujiao-backup configure
-dujiao-backup test
-dujiao-backup list-local
-dujiao-backup list-remote
-dujiao-backup verify
-dujiao-backup verify /path/to/archive.tar
-dujiao-backup logs
-dujiao-backup baota
-dujiao-backup update
-dujiao-backup version
 ```
+
+按区域显示：
+
+- 任务类型和源数据详细信息
+- 归档文件规则
+- 本地、OSS、SFTP 目标状态和路径
+- 保留数量与定时状态
+- 当前类型归档数量和最新归档
+- 最近一次成功或失败结果
+
+### 执行与归档历史
+
+```bash
+dujiao-backup history
+```
+
+历史分为两部分：
+
+1. **结构化执行记录**：开始/完成时间、耗时、任务类型、任务名称、归档、大小、目标和失败阶段
+2. **本地归档历史**：四种任务的归档按时间倒序显示，并标明 OSS/SFTP 校验标记状态
+
+历史记录文件：
+
+```text
+/opt/dujiao-backup/state/backup-history.tsv
+```
+
+最多保留 2000 条，超过后压缩为最近 1000 条。升级前已有归档即使没有结构化执行记录，也会出现在归档历史中。
+
+## 保留、补传与失败恢复
+
+- 保留数量按**当前任务类型**独立应用
+- 标准归档名才允许自动清理
+- 先确认启用的远端已经完成校验，再删除最旧本地归档
+- 远端缺少本地保留归档时，下次执行会自动补传
+- 上传失败时保留本地归档和失败历史，不会误报成功
+- 切换任务类型不会删除其他类型历史
 
 ## 定时任务
 
-内置定时使用 systemd，按“上一轮结束后再等待设定间隔”运行，避免任务堆积。
+### systemd
 
-例如：
+菜单支持按“天 + 小时 + 分钟”设置间隔，最短 1 分钟。服务使用互斥锁，重复触发不会并发执行。
 
-- `0天 0小时 2分钟`：每 2 分钟
-- `0天 6小时 0分钟`：每 6 小时
-- `1天 2小时 30分钟`：每 26 小时 30 分钟
+```bash
+systemctl status dujiao-backup.timer
+systemctl list-timers dujiao-backup.timer
+```
 
-宝塔中可新增“Shell 脚本”计划任务，执行用户为 root，内容为：
+### 宝塔计划任务
+
+任务类型选择“Shell 脚本”，用户使用 `root`：
 
 ```bash
 /usr/local/bin/dujiao-backup backup --scheduled
 ```
 
-如果使用宝塔，请在管理菜单停用内置 systemd 定时，避免重复触发。
+使用宝塔计划任务时，应停用内置 systemd 定时，防止重复触发。
 
-## 保留、同步与修复
-
-假设最多保留 `100` 份：
-
-- 新备份生成并成功同步到所有已启用目标后，才删除最旧备份
-- 任一远端上传失败时不执行保留清理，优先避免数据丢失
-- 下次运行会继续上传尚未同步的本地备份
-- 远端缺少仍在本地保留的备份时，会自动补传
-- 本地、OSS 和 SFTP 只清理当前业务类型的标准文件名
-- OSS 会核对对象大小和 SHA256 元数据
-- SFTP 会在远端直接计算 SHA256
-
-## 完整性校验
-
-校验最新一份当前业务备份：
+## 常用命令
 
 ```bash
-dujiao-backup verify
+dujiao-backup                   # 管理菜单
+dujiao-backup backup            # 执行当前任务
+dujiao-backup status            # 当前任务详情
+dujiao-backup history           # 执行记录和本地归档历史
+dujiao-backup configure         # 统一配置中心
+dujiao-backup test              # 测试已启用远端
+dujiao-backup list-local        # 全部本地归档
+dujiao-backup list-remote       # OSS/SFTP 远端归档
+dujiao-backup verify            # 校验当前任务最新归档
+dujiao-backup verify /path/a.tar
+dujiao-backup logs
+dujiao-backup update
+dujiao-backup version
 ```
 
-也可以指定任意 Dujiao 或 Komari 标准备份文件：
-
-```bash
-dujiao-backup verify /opt/dujiao-backup/backups/komari-20260816-120000.tar
-```
-
-校验内容包括：
-
-- 外层 TAR 固定结构和文件类型
-- 路径穿越、符号链接、硬链接和特殊文件防护
-- SHA256 清单
-- 内层压缩包路径安全
-- Dujiao SQLite `PRAGMA quick_check` 或 PostgreSQL dump 目录
-- Komari `data/komari.db` 的 `PRAGMA quick_check`
-- Komari 包中不存在运行时 WAL/SHM/journal 文件
-
-## Komari 恢复提示
-
-恢复会覆盖线上数据，请先在测试机演练，并保留当前数据目录副本。
-
-先校验和解包：
-
-```bash
-dujiao-backup verify /path/to/komari-YYYYMMDD-HHMMSS.tar
-mkdir -p /root/komari-restore
-tar -xf /path/to/komari-YYYYMMDD-HHMMSS.tar -C /root/komari-restore
-tar -xzf /root/komari-restore/data.tar.gz -C /root/komari-restore
-```
-
-确认 `/root/komari-restore/data/` 内容后，停止 Komari 容器，把当前宿主机数据目录改名保留，再将恢复出的 `data` 放回原 Mount Source，最后启动容器。实际宿主机目录请以 `dujiao-backup status` 显示为准，不要固定照抄 `/komari/data`。
-
-## 管理器文件
+## 文件位置
 
 ```text
 /opt/dujiao-backup/
 ├── dujiao-backup.sh
-├── config.conf
-├── logs/
-│   └── dujiao-backup.log
+├── config.conf                 # root:root 0600
 ├── backups/
 ├── keys/
 │   ├── sftp_ed25519
 │   ├── sftp_ed25519.pub
 │   └── known_hosts
+├── logs/
+│   └── dujiao-backup.log
 ├── state/
+│   ├── backup-history.tsv
+│   └── *.ok                    # 远端上传校验标记
 └── tmp/
 ```
 
-快捷命令：`/usr/local/bin/dujiao-backup`
+日志达到 10 MiB 自动轮转，保留 5 份历史日志。
 
-systemd 文件：
+## 安全设计
 
-```text
-/etc/systemd/system/dujiao-backup.service
-/etc/systemd/system/dujiao-backup.timer
-```
+- 必须使用 root 运行
+- 配置、日志、状态、密钥和本地归档默认权限 `0700/0600`
+- 配置写入使用临时文件和原子替换
+- AccessKey 和数据库密码不显示、不写命令行
+- SFTP 密码不保存
+- SSH 主机指纹固定
+- 本地归档先写隐藏 `.partial`，校验后原子改名
+- 外层和内层 TAR 都检查固定文件、成员类型、重复成员和路径穿越
+- 所有归档包含 SHA256 清单
+- OSS 和 SFTP 上传后都做远端校验
+- `flock` 防止并发备份
 
-日志达到 10 MiB 后自动轮转，保留 `.1` 到 `.5`。
-
-## 在线升级与兼容性
+## 升级兼容
 
 ```bash
 dujiao-backup update
 ```
 
-升级只替换主脚本，不覆盖配置、密钥、日志和备份。
+`v1.3.0` 保持 `CONFIG_VERSION=1`，旧配置可直接加载：
 
-从 `v1.1.x` 升级时，旧配置没有 `BACKUP_TYPE` 字段，脚本会自动按 `dujiao`（发卡备份）加载；进入统一配置中心后即可切换为 Komari 探针备份。
+- 旧配置没有新增字段时自动使用安全默认值
+- 原 `dujiao` / `komari` 任务不受影响
+- 原归档名、OSS/SFTP 标记和保留策略继续兼容
+- 进入配置中心后可切换到 `directory` 或 `mysql`
 
-支持范围：
+## 系统要求
 
-- Debian 11/12/13
-- Ubuntu 22.04/24.04 等使用 apt 和 systemd 的发行版
+- Debian / Ubuntu
+- root
 - Bash 4.4+
-- CPU：amd64 或 arm64（OSS 模式）
-- Dujiao-Next 官方 Docker Compose 方案 A/B
-- Komari Docker 部署，`/app/data` 挂载到宿主机目录或 Docker volume
+- `apt-get`
+- Dujiao / Komari 类型需要 Docker
+- MySQL 宿主机模式需要 `mysql`/`mariadb` 和 `mysqldump`/`mariadb-dump`；向导可自动安装
+- OSS 模式支持 amd64 / arm64 的 `ossutil`
+
+## 开发与测试
+
+```bash
+bash -n dujiao-backup.sh
+shellcheck -S warning -x dujiao-backup.sh tests/*.sh
+bash dujiao-backup.sh self-test
+```
+
+GitHub Actions 包含：
+
+- Bash 与 ShellCheck 静态检查
+- Debian bookworm / trixie 自检
+- Dujiao SQLite / PostgreSQL 集成测试
+- Komari WAL 一致性测试
+- 自定义目录备份、恢复、保留与恶意链接拒绝测试
+- MySQL/MariaDB TCP 与 Docker 模式备份、校验和真实恢复测试
+- OSS 上传、补传、校验与保留测试
+- SFTP 上传、补传、校验与保留测试
 
 ## License
 
-MIT
+[MIT](LICENSE)

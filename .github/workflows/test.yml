@@ -15,15 +15,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Bash syntax
-        run: bash -n dujiao-backup.sh tests/fake-ossutil tests/integration-komari.sh tests/integration-oss.sh tests/integration-sftp.sh
+        run: bash -n dujiao-backup.sh tests/fake-ossutil tests/integration-komari.sh tests/integration-directory.sh tests/integration-mysql.sh tests/integration-oss.sh tests/integration-sftp.sh
       - name: Python syntax
         run: python3 -m py_compile tests/pty-run.py
       - name: ShellCheck
-        run: shellcheck -S warning -x dujiao-backup.sh tests/fake-ossutil tests/integration-komari.sh tests/integration-oss.sh tests/integration-sftp.sh
+        run: shellcheck -S warning -x dujiao-backup.sh tests/fake-ossutil tests/integration-komari.sh tests/integration-directory.sh tests/integration-mysql.sh tests/integration-oss.sh tests/integration-sftp.sh
       - name: Built-in self test
         run: bash dujiao-backup.sh self-test
       - name: Version contract
-        run: test "$(bash dujiao-backup.sh version)" = "1.2.2"
+        run: test "$(bash dujiao-backup.sh version)" = "1.3.0"
 
   debian:
     runs-on: ubuntu-latest
@@ -171,6 +171,22 @@ jobs:
           docker exec -i "$container" pg_restore -U dujiao -d restore_test \
             < /tmp/dujiao-restore-check/database.dump
           test "$(docker exec "$container" psql -U dujiao -d restore_test -Atc 'SELECT count(*) FROM products')" = "1"
+
+  directory-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Back up, verify, restore and retain a custom directory
+        run: sudo env DUJIAO_INTEGRATION_TEST=1 bash tests/integration-directory.sh
+
+  mysql-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install MariaDB client
+        run: sudo apt-get update && sudo apt-get install -y mariadb-client util-linux
+      - name: Back up and restore MariaDB over TCP and Docker-local connection
+        run: sudo env DUJIAO_INTEGRATION_TEST=1 bash tests/integration-mysql.sh
 
   komari-integration:
     runs-on: ubuntu-latest

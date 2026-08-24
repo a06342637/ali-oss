@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-readonly PROGRAM_NAME="Dujiao-Next / Komari Backup Manager"
-readonly VERSION="1.2.2"
+readonly PROGRAM_NAME="Server Backup Manager"
+readonly VERSION="1.3.0"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -14,6 +14,7 @@ readonly LOG_FILE="$LOG_DIR/dujiao-backup.log"
 readonly BACKUP_DIR="$INSTALL_DIR/backups"
 readonly KEY_DIR="$INSTALL_DIR/keys"
 readonly STATE_DIR="$INSTALL_DIR/state"
+readonly HISTORY_FILE="$STATE_DIR/backup-history.tsv"
 readonly TMP_DIR="$INSTALL_DIR/tmp"
 readonly LOCK_FILE="/run/lock/dujiao-backup.lock"
 readonly COMMAND_LINK="/usr/local/bin/dujiao-backup"
@@ -29,6 +30,10 @@ LOG_CAPTURED=0
 LOG_CAPTURE_PID=""
 ERROR_HANDLED=0
 ACTIVE_PARTIAL=""
+CREATED_ARCHIVE=""
+ACTIVE_BACKUP_RUN=0
+ACTIVE_RUN_ID=""
+ACTIVE_RUN_STARTED=""
 declare -a TEMP_PATHS=()
 
 CONFIG_VERSION="1"
@@ -41,6 +46,19 @@ PG_CONTAINER="dujiaonext-postgres"
 KOMARI_CONTAINER="komari"
 KOMARI_DATA_DIR="/komari/data"
 KOMARI_DB_FILE="/komari/data/komari.db"
+CUSTOM_DIR_NAME="自定义目录"
+CUSTOM_DIR="/var/www"
+MYSQL_TASK_NAME="MySQL 数据库"
+MYSQL_MODE="host"
+MYSQL_CONNECTION="tcp"
+MYSQL_HOST="127.0.0.1"
+MYSQL_PORT="3306"
+MYSQL_SOCKET="/run/mysqld/mysqld.sock"
+MYSQL_CONTAINER=""
+MYSQL_USER="root"
+MYSQL_PASSWORD=""
+MYSQL_DATABASE_MODE="selected"
+MYSQL_DATABASES=""
 MAX_BACKUPS="100"
 OSS_ENABLED="0"
 OSS_ACCESS_KEY_ID=""
@@ -83,8 +101,11 @@ log_message() {
 }
 
 info() { log_message "INFO" "$*"; }
+
 warn() { log_message "WARN" "$*"; }
+
 success() { log_message "SUCCESS" "$*"; }
+
 error() { log_message "ERROR" "$*" >&2; }
 
 heading() {
@@ -129,6 +150,9 @@ finish_log_capture() {
 cleanup() {
   local path
   set +e
+  if [[ "$ACTIVE_BACKUP_RUN" -eq 1 ]]; then
+    finish_backup_history "failed" "$CREATED_ARCHIVE" "$CURRENT_STEP"
+  fi
   if [[ -n "$ACTIVE_PARTIAL" && "$ACTIVE_PARTIAL" == "$BACKUP_DIR"/.*.partial ]]; then
     rm -f -- "$ACTIVE_PARTIAL"
   fi
@@ -144,6 +168,79 @@ trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 trap cleanup EXIT
 
 register_temp() { TEMP_PATHS+=("$1"); }
+
+sanitize_history_field() {
+  local value="$1"
+  value="${value//$'\t'/ }"
+  value="${value//$'\r'/ }"
+  value="${value//$'\n'/ }"
+  printf '%s' "$value"
+}
+
+backup_task_name() {
+  case "$BACKUP_TYPE" in
+    dujiao) printf 'Dujiao-Next 发卡完整备份' ;;
+    komari) printf 'Komari 探针完整备份' ;;
+    directory) printf '%s' "$CUSTOM_DIR_NAME" ;;
+    mysql) printf '%s' "$MYSQL_TASK_NAME" ;;
+    *) printf '未知任务' ;;
+  esac
+}
+backup_targets_label() {
+  local value="本地"
+  [[ "$OSS_ENABLED" -eq 0 ]] || value="$value + OSS"
+  [[ "$SFTP_ENABLED" -eq 0 ]] || value="$value + SFTP"
+  printf '%s' "$value"
+}
+
+record_backup_history() {
+  local status="$1"
+  local archive="$2"
+  local details="$3"
+  local archive_name="-" archive_size="0" temporary line_count
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" && ! -L "$HISTORY_FILE" ]] || return 0
+  if [[ -n "$archive" && -f "$archive" ]]; then
+    archive_name="$(basename "$archive")"
+    archive_size="$(stat -c %s "$archive" 2>/dev/null || printf '0')"
+  fi
+  touch "$HISTORY_FILE" 2>/dev/null || return 0
+  chmod 0600 "$HISTORY_FILE" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(sanitize_history_field "$ACTIVE_RUN_ID")" \
+    "$(sanitize_history_field "$ACTIVE_RUN_STARTED")" \
+    "$(now)" \
+    "$(sanitize_history_field "$BACKUP_TYPE")" \
+    "$(sanitize_history_field "$status")" \
+    "$(sanitize_history_field "$archive_name")" \
+    "$archive_size" \
+    "$(sanitize_history_field "$(backup_targets_label)")" \
+    "$(sanitize_history_field "$details")" \
+    "$(sanitize_history_field "$(backup_task_name)")" >> "$HISTORY_FILE" || return 0
+  line_count="$(wc -l < "$HISTORY_FILE" 2>/dev/null || printf '0')"
+  if [[ "$line_count" -gt 2000 ]]; then
+    temporary="$HISTORY_FILE.new.$$"
+    tail -n 1000 "$HISTORY_FILE" > "$temporary" 2>/dev/null \
+      && chmod 0600 "$temporary" \
+      && mv -f -- "$temporary" "$HISTORY_FILE"
+    rm -f -- "$temporary" 2>/dev/null || true
+  fi
+}
+
+begin_backup_history() {
+  ACTIVE_RUN_ID="$(date +%Y%m%d%H%M%S)-$$"
+  ACTIVE_RUN_STARTED="$(now)"
+  ACTIVE_BACKUP_RUN=1
+  CREATED_ARCHIVE=""
+}
+
+finish_backup_history() {
+  local status="$1"
+  local archive="$2"
+  local details="$3"
+  [[ "$ACTIVE_BACKUP_RUN" -eq 1 ]] || return 0
+  ACTIVE_BACKUP_RUN=0
+  record_backup_history "$status" "$archive" "$details"
+}
 
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || die "请使用 root 用户运行。"
@@ -161,9 +258,10 @@ ensure_runtime_dirs() {
   install -d -o root -g root -m 0700 \
     "$INSTALL_DIR" "$LOG_DIR" "$BACKUP_DIR" "$KEY_DIR" "$STATE_DIR" "$TMP_DIR"
   [[ ! -L "$LOG_FILE" ]] || die "日志文件不能是符号链接：$LOG_FILE"
-  touch "$LOG_FILE"
-  chown root:root "$LOG_FILE"
-  chmod 0600 "$LOG_FILE"
+  [[ ! -L "$HISTORY_FILE" ]] || die "历史记录文件不能是符号链接：$HISTORY_FILE"
+  touch "$LOG_FILE" "$HISTORY_FILE"
+  chown root:root "$LOG_FILE" "$HISTORY_FILE"
+  chmod 0600 "$LOG_FILE" "$HISTORY_FILE"
 }
 
 rotate_logs_if_needed() {
@@ -355,6 +453,19 @@ set_config_defaults() {
   KOMARI_CONTAINER="komari"
   KOMARI_DATA_DIR="/komari/data"
   KOMARI_DB_FILE="/komari/data/komari.db"
+  CUSTOM_DIR_NAME="自定义目录"
+  CUSTOM_DIR="/var/www"
+  MYSQL_TASK_NAME="MySQL 数据库"
+  MYSQL_MODE="host"
+  MYSQL_CONNECTION="tcp"
+  MYSQL_HOST="127.0.0.1"
+  MYSQL_PORT="3306"
+  MYSQL_SOCKET="/run/mysqld/mysqld.sock"
+  MYSQL_CONTAINER=""
+  MYSQL_USER="root"
+  MYSQL_PASSWORD=""
+  MYSQL_DATABASE_MODE="selected"
+  MYSQL_DATABASES=""
   MAX_BACKUPS="100"
   OSS_ENABLED="0"
   OSS_ACCESS_KEY_ID=""
@@ -391,17 +502,19 @@ load_config() {
   fi
   APP_DIR="$(normalize_absolute_path "$APP_DIR")"
   KOMARI_DATA_DIR="$(normalize_absolute_path "$KOMARI_DATA_DIR")"
+  CUSTOM_DIR="$(normalize_absolute_path "$CUSTOM_DIR")"
+  [[ -z "$MYSQL_SOCKET" ]] || MYSQL_SOCKET="$(normalize_absolute_path "$MYSQL_SOCKET")"
   SFTP_REMOTE_DIR="$(normalize_absolute_path "$SFTP_REMOTE_DIR")"
   [[ "$OSS_DELETE_ALL_VERSIONS" == "1" ]] && OSS_VERSIONING_ENABLED="1"
   # 密钥文件属于管理器内部状态，不接受配置文件改写到任意系统路径。
   SFTP_KEY_FILE="$KEY_DIR/sftp_ed25519"
   SFTP_KNOWN_HOSTS="$KEY_DIR/known_hosts"
   validate_loaded_config
-  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
-    set_deployment_paths
-  else
-    set_komari_paths
-  fi
+  case "$BACKUP_TYPE" in
+    dujiao) set_deployment_paths ;;
+    komari) set_komari_paths ;;
+    directory|mysql) ;;
+  esac
 }
 
 write_config_value() {
@@ -414,8 +527,8 @@ save_config() {
   local temporary="$CONFIG_FILE.new.$$"
   CURRENT_STEP="写入配置文件"
   {
-    printf '# Dujiao-Next / Komari Backup Manager v%s\n' "$VERSION"
-    printf '# 本文件含 OSS 密钥，只允许 root 读取。请优先通过管理菜单修改。\n'
+    printf '# Server Backup Manager v%s\n' "$VERSION"
+    printf '# 本文件含 OSS 与数据库密钥，只允许 root 读取。请优先通过管理菜单修改。\n'
     printf '# SFTP 登录密码不会保存；这里只保存专用 SSH 私钥路径。\n\n'
     printf 'CONFIG_VERSION=%q\n' "$CONFIG_VERSION"
     write_config_value BACKUP_TYPE
@@ -426,6 +539,19 @@ save_config() {
     write_config_value PG_CONTAINER
     write_config_value KOMARI_CONTAINER
     write_config_value KOMARI_DATA_DIR
+    write_config_value CUSTOM_DIR_NAME
+    write_config_value CUSTOM_DIR
+    write_config_value MYSQL_TASK_NAME
+    write_config_value MYSQL_MODE
+    write_config_value MYSQL_CONNECTION
+    write_config_value MYSQL_HOST
+    write_config_value MYSQL_PORT
+    write_config_value MYSQL_SOCKET
+    write_config_value MYSQL_CONTAINER
+    write_config_value MYSQL_USER
+    write_config_value MYSQL_PASSWORD
+    write_config_value MYSQL_DATABASE_MODE
+    write_config_value MYSQL_DATABASES
     write_config_value MAX_BACKUPS
     write_config_value OSS_ENABLED
     write_config_value OSS_ACCESS_KEY_ID
@@ -469,9 +595,42 @@ validate_uint_between() {
   (( value >= minimum && value <= maximum ))
 }
 
+is_safe_local_absolute_path() {
+  local path="$1"
+  [[ "$path" == /* && "$path" != "/" ]] || return 1
+  [[ "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *$'\t'* ]] || return 1
+  [[ "$path" != *"//"* && "$path" != "/.." && "$path" != ../* \
+    && "$path" != *"/../"* && "$path" != *"/.." \
+    && "$path" != "/." && "$path" != ./* \
+    && "$path" != *"/./"* && "$path" != *"/." ]]
+}
+
+is_safe_display_name() {
+  local value="$1"
+  [[ -n "$value" && "${#value}" -le 80 && "$value" != *[[:cntrl:]]* ]] || return 1
+  ! is_blank_input "$value"
+}
+
+valid_mysql_database_selection() {
+  local value="$1" item seen=","
+  local -a items
+  [[ -n "$value" ]] || return 1
+  IFS=',' read -r -a items <<< "$value"
+  [[ "${#items[@]}" -gt 0 ]] || return 1
+  for item in "${items[@]}"; do
+    [[ "$item" =~ ^[A-Za-z0-9_.\$][A-Za-z0-9_.\$-]*$ ]] || return 1
+    [[ "$item" != "information_schema" && "$item" != "performance_schema" ]] || return 1
+    [[ "$seen" != *",$item,"* ]] || return 1
+    seen="${seen}${item},"
+  done
+}
+
 validate_loaded_config() {
   [[ "$CONFIG_VERSION" == "1" ]] || die "CONFIG_VERSION 配置无效。"
-  [[ "$BACKUP_TYPE" == "dujiao" || "$BACKUP_TYPE" == "komari" ]] || die "BACKUP_TYPE 配置必须是 dujiao 或 komari。"
+  case "$BACKUP_TYPE" in
+    dujiao|komari|directory|mysql) ;;
+    *) die "BACKUP_TYPE 配置必须是 dujiao、komari、directory 或 mysql。" ;;
+  esac
   is_safe_absolute_path "$APP_DIR" || die "APP_DIR 必须是安全的绝对路径。"
   [[ "$PG_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "PG_CONTAINER 配置无效。"
   [[ "$KOMARI_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "KOMARI_CONTAINER 配置无效。"
@@ -489,12 +648,41 @@ validate_loaded_config() {
   validate_uint_between "$TIMER_HOURS" 0 23 || die "TIMER_HOURS 配置无效。"
   validate_uint_between "$TIMER_MINUTES" 0 59 || die "TIMER_MINUTES 配置无效。"
   validate_uint_between "$SFTP_PORT" 1 65535 || die "SFTP_PORT 配置无效。"
-  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
-    case "$DEPLOY_MODE" in
-      sqlite|postgres) ;;
-      *) die "Dujiao DEPLOY_MODE 配置必须是 sqlite 或 postgres。" ;;
-    esac
-  fi
+  case "$BACKUP_TYPE" in
+    dujiao)
+      case "$DEPLOY_MODE" in
+        sqlite|postgres) ;;
+        *) die "Dujiao DEPLOY_MODE 配置必须是 sqlite 或 postgres。" ;;
+      esac
+      ;;
+    directory)
+      is_safe_display_name "$CUSTOM_DIR_NAME" || die "CUSTOM_DIR_NAME 必须是 1 到 80 个可见字符。"
+      is_safe_local_absolute_path "$CUSTOM_DIR" || die "CUSTOM_DIR 必须是安全的绝对路径。"
+      ;;
+    mysql)
+      is_safe_display_name "$MYSQL_TASK_NAME" || die "MYSQL_TASK_NAME 必须是 1 到 80 个可见字符。"
+      [[ "$MYSQL_MODE" == "host" || "$MYSQL_MODE" == "docker" ]] || die "MYSQL_MODE 必须是 host 或 docker。"
+      [[ "$MYSQL_CONNECTION" == "tcp" || "$MYSQL_CONNECTION" == "socket" ]] || die "MYSQL_CONNECTION 必须是 tcp 或 socket。"
+      [[ "$MYSQL_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "MYSQL_HOST 格式无效。"
+      validate_uint_between "$MYSQL_PORT" 1 65535 || die "MYSQL_PORT 必须是 1 到 65535。"
+      [[ "$MYSQL_USER" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "MYSQL_USER 格式无效。"
+      [[ "$MYSQL_PASSWORD" != *$'\n'* && "$MYSQL_PASSWORD" != *$'\r'* ]] || die "MYSQL_PASSWORD 不能包含换行符。"
+      [[ "$MYSQL_DATABASE_MODE" == "selected" || "$MYSQL_DATABASE_MODE" == "business" || "$MYSQL_DATABASE_MODE" == "all" ]] \
+        || die "MYSQL_DATABASE_MODE 必须是 selected、business 或 all。"
+      if [[ "$MYSQL_DATABASE_MODE" != "selected" && -n "$MYSQL_DATABASES" ]]; then
+        die "MYSQL_DATABASES 只有在指定数据库模式下才能填写。"
+      fi
+      if [[ "$MYSQL_DATABASE_MODE" == "selected" ]]; then
+        valid_mysql_database_selection "$MYSQL_DATABASES" || die "MYSQL_DATABASES 必须是逗号分隔的有效数据库名称。"
+      fi
+      if [[ "$MYSQL_MODE" == "docker" ]]; then
+        [[ "$MYSQL_CONNECTION" == "socket" ]] || die "Docker MySQL 备份必须使用容器内本地 Socket。"
+        [[ "$MYSQL_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "MYSQL_CONTAINER 配置无效。"
+      elif [[ "$MYSQL_CONNECTION" == "socket" ]]; then
+        is_safe_absolute_path "$MYSQL_SOCKET" || die "MYSQL_SOCKET 必须是安全的绝对路径。"
+      fi
+      ;;
+  esac
   if [[ "$TIMER_ENABLED" -eq 1 ]]; then
     [[ "$((TIMER_DAYS * 86400 + TIMER_HOURS * 3600 + TIMER_MINUTES * 60))" -ge 60 ]] || die "启用定时时，间隔不能全部为 0。"
   fi
@@ -560,7 +748,29 @@ backup_type_label() {
   case "$BACKUP_TYPE" in
     dujiao) printf '发卡备份（Dujiao-Next）' ;;
     komari) printf '探针备份（Komari）' ;;
+    directory) printf '自定义目录备份（%s）' "$CUSTOM_DIR_NAME" ;;
+    mysql) printf 'MySQL 数据库备份（%s）' "$MYSQL_TASK_NAME" ;;
     *) printf '未知备份类型' ;;
+  esac
+}
+
+backup_type_code_label() {
+  case "$1" in
+    dujiao) printf 'Dujiao-Next' ;;
+    komari) printf 'Komari' ;;
+    directory) printf '自定义目录' ;;
+    mysql) printf 'MySQL' ;;
+    *) printf '未知' ;;
+  esac
+}
+
+archive_type_label() {
+  case "$1" in
+    dujiao-next-*) printf 'Dujiao-Next' ;;
+    komari-*) printf 'Komari' ;;
+    directory-*) printf '自定义目录' ;;
+    mysql-*) printf 'MySQL' ;;
+    *) printf '未知' ;;
   esac
 }
 
@@ -568,6 +778,8 @@ archive_prefix() {
   case "$BACKUP_TYPE" in
     dujiao) printf 'dujiao-next' ;;
     komari) printf 'komari' ;;
+    directory) printf 'directory' ;;
+    mysql) printf 'mysql' ;;
     *) return 1 ;;
   esac
 }
@@ -758,26 +970,452 @@ choose_komari_interactive() {
   success "Komari 数据目录检查通过：$KOMARI_DATA_DIR"
 }
 
+validate_custom_directory() {
+  local resolved unexpected path
+  is_safe_local_absolute_path "$CUSTOM_DIR" \
+    || die "自定义目录必须是安全的绝对路径，不能是根目录或包含 ..。"
+  [[ -d "$CUSTOM_DIR" && ! -L "$CUSTOM_DIR" ]] \
+    || die "自定义目录不存在或本身是符号链接：$CUSTOM_DIR"
+  resolved="$(readlink -f -- "$CUSTOM_DIR")"
+  [[ "$resolved" == "$CUSTOM_DIR" ]] \
+    || die "自定义目录必须使用规范化真实路径，当前真实路径为：$resolved"
+  while IFS= read -r -d '' path; do
+    [[ "$path" != *[[:cntrl:]]* ]] \
+      || die "自定义目录内的文件名不能包含换行、Tab 或其他控制字符：$path"
+  done < <(find -P "$CUSTOM_DIR" -mindepth 1 -print0)
+  case "$CUSTOM_DIR/" in
+    "$BACKUP_DIR/"*) die "不能备份管理器的备份输出目录或其子目录。" ;;
+  esac
+  case "$BACKUP_DIR/" in
+    "$CUSTOM_DIR/"*) die "自定义目录包含备份输出目录，会造成递归备份，已拒绝。" ;;
+  esac
+  unexpected="$(find -P "$CUSTOM_DIR" ! -type d ! -type f -print -quit)"
+  [[ -z "$unexpected" ]] \
+    || die "自定义目录包含符号链接或特殊文件；为保证可验证恢复，已拒绝：$unexpected"
+  unexpected="$(find -P "$CUSTOM_DIR" -type f ! -readable -print -quit)"
+  [[ -z "$unexpected" ]] || die "自定义目录中存在不可读文件：$unexpected"
+}
+
+choose_custom_directory_interactive() {
+  local input_name input_dir resolved confirmed file_count source_size
+  heading "配置自定义目录备份"
+  prompt_text input_name "任务名称" "$CUSTOM_DIR_NAME" 1
+  is_safe_display_name "$input_name" || die "任务名称必须是 1 到 80 个可见字符。"
+  prompt_text input_dir "需要完整备份的目录绝对路径" "$CUSTOM_DIR" 1
+  input_dir="$(normalize_absolute_path "$input_dir")"
+  is_safe_local_absolute_path "$input_dir" \
+    || die "目录必须使用安全的绝对路径，不能是 /、包含控制字符或 ..。"
+  [[ -d "$input_dir" ]] || die "目录不存在：$input_dir"
+  resolved="$(readlink -f -- "$input_dir")"
+  [[ -n "$resolved" ]] || die "无法解析目录真实路径：$input_dir"
+  CUSTOM_DIR_NAME="$input_name"
+  CUSTOM_DIR="$resolved"
+  validate_custom_directory
+  file_count="$(find -P "$CUSTOM_DIR" -type f | wc -l | tr -d ' ')"
+  source_size="$(du -sh -- "$CUSTOM_DIR" 2>/dev/null | awk '{print $1}')"
+  printf '\n任务名称 : %s\n' "$CUSTOM_DIR_NAME"
+  printf '源目录   : %s\n' "$CUSTOM_DIR"
+  printf '普通文件 : %s 个\n' "$file_count"
+  printf '当前大小 : %s\n' "${source_size:-未知}"
+  printf '安全策略 : 拒绝符号链接、设备、Socket 和其他特殊文件\n'
+  warn "目录归档是文件级快照；高频写入业务建议先暂停写入或使用文件系统快照。"
+  prompt_yes_no confirmed "确认保存此自定义目录任务" 1
+  [[ "$confirmed" -eq 1 ]] || die "用户取消了自定义目录配置。"
+  success "自定义目录检查通过：$CUSTOM_DIR"
+}
+
+mysql_host_client_binary() {
+  if command -v mariadb >/dev/null 2>&1; then
+    command -v mariadb
+  elif command -v mysql >/dev/null 2>&1; then
+    command -v mysql
+  else
+    return 1
+  fi
+}
+
+mysql_host_dump_binary() {
+  if command -v mariadb-dump >/dev/null 2>&1; then
+    command -v mariadb-dump
+  elif command -v mysqldump >/dev/null 2>&1; then
+    command -v mysqldump
+  else
+    return 1
+  fi
+}
+
+detect_mysql_docker_containers() {
+  local name image lower
+  command -v docker >/dev/null 2>&1 || return 0
+  while IFS='|' read -r name image; do
+    [[ -n "$name" ]] || continue
+    lower="${image,,}"
+    case "$lower" in
+      *mysql*|*mariadb*|*percona*) printf '%s|%s\n' "$name" "$image" ;;
+    esac
+  done < <(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null || true)
+}
+
+detect_single_mysql_container() {
+  local name image found="" count=0
+  while IFS='|' read -r name image; do
+    [[ -n "$name" ]] || continue
+    found="$name"
+    count="$((count + 1))"
+  done < <(detect_mysql_docker_containers)
+  [[ "$count" -eq 1 ]] || return 1
+  printf '%s' "$found"
+}
+
+scan_mysql_environment() {
+  local client="未发现" dump="未发现" server="未发现" service found=0 package_rows containers
+  client="$(mysql_host_client_binary 2>/dev/null || printf '未发现')"
+  dump="$(mysql_host_dump_binary 2>/dev/null || printf '未发现')"
+  server="$(command -v mariadbd 2>/dev/null || command -v mysqld 2>/dev/null || printf '未发现')"
+  printf '\n[宿主机程序]\n'
+  printf '  查询客户端 : %s\n' "$client"
+  printf '  导出工具   : %s\n' "$dump"
+  printf '  服务端程序 : %s\n' "$server"
+  printf '\n[本机服务]\n'
+  if command -v systemctl >/dev/null 2>&1; then
+    for service in mysql mariadb mysqld; do
+      if systemctl is-active --quiet "$service" 2>/dev/null; then
+        printf '  %-12s : 运行中\n' "$service"
+        found=1
+      fi
+    done
+  fi
+  if [[ "$found" -eq 0 ]]; then
+    printf '  未发现运行中的 mysql/mariadb systemd 服务（仍可连接远程数据库）。\n'
+  fi
+  if command -v dpkg-query >/dev/null 2>&1; then
+    package_rows="$(dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null \
+      | awk '$2 ~ /^ii/ && tolower($1) ~ /(mysql|mariadb|percona)/ && count < 12 {print "  " $1; count++}')"
+    printf '\n[已安装软件包]\n%s\n' "${package_rows:-  未发现 MySQL/MariaDB 相关软件包}"
+  fi
+  printf '\n[Docker 数据库容器]\n'
+  containers="$(detect_mysql_docker_containers)"
+  if [[ -n "$containers" ]]; then
+    while IFS='|' read -r service package_rows; do
+      printf '  %-24s %s\n' "$service" "$package_rows"
+    done <<< "$containers"
+  else
+    printf '  未发现运行中的 MySQL/MariaDB/Percona 容器。\n'
+  fi
+}
+
+install_mysql_client_interactive() {
+  CURRENT_STEP="安装 MySQL/MariaDB 客户端"
+  command -v apt-get >/dev/null 2>&1 || die "没有 apt-get，无法自动安装数据库客户端。"
+  info "正在安装 Debian/Ubuntu 默认 MySQL 客户端..."
+  apt-get update
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y default-mysql-client; then
+    warn "default-mysql-client 安装失败，尝试安装 mariadb-client。"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-client
+  fi
+  mysql_host_client_binary >/dev/null 2>&1 || die "数据库查询客户端安装后仍不可用。"
+  mysql_host_dump_binary >/dev/null 2>&1 || die "数据库导出工具安装后仍不可用。"
+  success "MySQL/MariaDB 客户端工具安装完成。"
+}
+
+mysql_sql_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\'/\'\'}"
+  printf "'%s'" "$value"
+}
+
+mysql_option_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+write_mysql_defaults_file() {
+  local file="$1"
+  {
+    printf '[client]\n'
+    printf 'user="%s"\n' "$(mysql_option_escape "$MYSQL_USER")"
+    printf 'password="%s"\n' "$(mysql_option_escape "$MYSQL_PASSWORD")"
+    printf 'default-character-set=utf8mb4\n'
+    if [[ "$MYSQL_MODE" == "host" ]]; then
+      if [[ "$MYSQL_CONNECTION" == "socket" ]]; then
+        printf 'protocol=socket\n'
+        printf 'socket="%s"\n' "$(mysql_option_escape "$MYSQL_SOCKET")"
+      else
+        printf 'protocol=tcp\n'
+        printf 'host="%s"\n' "$(mysql_option_escape "$MYSQL_HOST")"
+        printf 'port=%s\n' "$MYSQL_PORT"
+      fi
+    fi
+  } > "$file"
+  chmod 0600 "$file"
+}
+
+run_mysql_tool() {
+  local kind="$1"
+  local defaults binary rc
+  shift
+  defaults="$(mktemp "$TMP_DIR/mysql-client.XXXXXX")"
+  register_temp "$defaults"
+  write_mysql_defaults_file "$defaults"
+  if [[ "$MYSQL_MODE" == "host" ]]; then
+    if [[ "$kind" == "client" ]]; then
+      binary="$(mysql_host_client_binary 2>/dev/null || true)"
+    else
+      binary="$(mysql_host_dump_binary 2>/dev/null || true)"
+    fi
+    if [[ -z "$binary" ]]; then
+      rm -f -- "$defaults"
+      return 127
+    fi
+    if "$binary" --defaults-extra-file="$defaults" "$@"; then rc=0; else rc="$?"; fi
+  else
+    if docker exec -i "$MYSQL_CONTAINER" sh -eu -c '
+      kind="$1"
+      shift
+      defaults="/tmp/server-backup-mysql.$$"
+      trap '\''rm -f -- "$defaults"'\'' EXIT HUP INT TERM
+      umask 077
+      cat > "$defaults"
+      if [ "$kind" = client ]; then
+        binary="$(command -v mariadb 2>/dev/null || command -v mysql 2>/dev/null || true)"
+      else
+        binary="$(command -v mariadb-dump 2>/dev/null || command -v mysqldump 2>/dev/null || true)"
+      fi
+      [ -n "$binary" ] || exit 127
+      "$binary" --defaults-extra-file="$defaults" "$@"
+    ' sh "$kind" "$@" < "$defaults"; then rc=0; else rc="$?"; fi
+  fi
+  rm -f -- "$defaults"
+  return "$rc"
+}
+
+mysql_dump_supports_option() {
+  local option="$1" help
+  help="$(run_mysql_tool dump --help 2>/dev/null || true)"
+  grep -Fq -- "$option" <<< "$help"
+}
+
+mysql_query() {
+  run_mysql_tool client --connect-timeout=10 --batch --raw --skip-column-names --execute "$1"
+}
+
+mysql_list_databases() {
+  mysql_query 'SHOW DATABASES;'
+}
+
+mysql_business_databases() {
+  mysql_list_databases | while IFS= read -r database; do
+    case "$database" in
+      information_schema|performance_schema|mysql|sys|'') ;;
+      *) printf '%s\n' "$database" ;;
+    esac
+  done
+}
+
+mysql_database_mode_label() {
+  case "$MYSQL_DATABASE_MODE" in
+    selected) printf '指定数据库：%s' "$MYSQL_DATABASES" ;;
+    business) printf '全部业务数据库（自动排除 4 个系统库）' ;;
+    all) printf '全实例（包含 mysql/sys 与账户权限；虚拟库按服务端生成）' ;;
+  esac
+}
+
+mysql_database_names_for_backup() {
+  local item
+  local -a selected
+  case "$MYSQL_DATABASE_MODE" in
+    selected)
+      IFS=',' read -r -a selected <<< "$MYSQL_DATABASES"
+      for item in "${selected[@]}"; do printf '%s\n' "$item"; done
+      ;;
+    business) mysql_business_databases ;;
+    all) mysql_list_databases | grep -Ev '^(information_schema|performance_schema)$' ;;
+  esac
+}
+
+validate_mysql_source() {
+  local version database available
+  local -a configured
+  if [[ "$MYSQL_MODE" == "host" ]]; then
+    if [[ "$MYSQL_CONNECTION" == "tcp" ]]; then
+      [[ "$MYSQL_HOST" != *[[:space:]]* ]] || die "MYSQL_HOST 不能包含空白字符。"
+    fi
+    mysql_host_client_binary >/dev/null 2>&1 \
+      || die "未找到 mysql/mariadb 查询客户端，请在配置菜单自动安装。"
+    mysql_host_dump_binary >/dev/null 2>&1 \
+      || die "未找到 mysqldump/mariadb-dump，请在配置菜单自动安装。"
+    if [[ "$MYSQL_CONNECTION" == "socket" ]]; then
+      [[ -S "$MYSQL_SOCKET" ]] || die "MySQL Unix Socket 不存在：$MYSQL_SOCKET"
+    fi
+  else
+    command -v docker >/dev/null 2>&1 || die "未找到 Docker。"
+    docker inspect "$MYSQL_CONTAINER" >/dev/null 2>&1 || die "未找到 MySQL 容器：$MYSQL_CONTAINER"
+    [[ "$(docker inspect -f '{{.State.Running}}' "$MYSQL_CONTAINER" 2>/dev/null)" == "true" ]] \
+      || die "MySQL 容器没有运行：$MYSQL_CONTAINER"
+    docker exec "$MYSQL_CONTAINER" sh -c \
+      'command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1' \
+      || die "容器内没有 mysql/mariadb 查询客户端：$MYSQL_CONTAINER"
+    docker exec "$MYSQL_CONTAINER" sh -c \
+      'command -v mariadb-dump >/dev/null 2>&1 || command -v mysqldump >/dev/null 2>&1' \
+      || die "容器内没有 mysqldump/mariadb-dump：$MYSQL_CONTAINER"
+  fi
+  if [[ "$MYSQL_MODE" == "host" ]]; then
+    info "使用宿主机客户端：$(mysql_host_dump_binary)"
+  else
+    info "使用 Docker 容器内客户端：$MYSQL_CONTAINER"
+  fi
+  version="$(mysql_query 'SELECT VERSION();')" || die "无法连接 MySQL，请核对连接地址、账户、密码和权限。"
+  [[ -n "$version" ]] || die "MySQL 返回了空版本信息。"
+  available="$(mysql_list_databases)" || die "账户无权读取数据库列表。"
+  if [[ "$MYSQL_DATABASE_MODE" == "selected" ]]; then
+    IFS=',' read -r -a configured <<< "$MYSQL_DATABASES"
+    for database in "${configured[@]}"; do
+      grep -Fqx -- "$database" <<< "$available" \
+        || die "MySQL 中没有找到指定数据库，或账户无权查看：$database"
+    done
+  elif [[ "$MYSQL_DATABASE_MODE" == "all" ]]; then
+    [[ -n "$(mysql_query "SELECT 1 FROM mysql.user LIMIT 1;" 2>/dev/null)" ]] \
+      || die "全实例备份需要读取 mysql 系统库；当前账户权限不足，请改用授权账号或选择业务库模式。"
+  elif [[ "$MYSQL_DATABASE_MODE" == "business" ]]; then
+    [[ -n "$(printf '%s\n' "$available" | grep -Ev '^(information_schema|performance_schema|mysql|sys)$')" ]] \
+      || die "没有发现可备份的业务数据库。"
+  fi
+}
+
+choose_mysql_interactive() {
+  local choice default_choice connection_choice detected input_value has_password install_client
+  local version available database index selection_default
+  heading "扫描并配置 MySQL 数据库备份"
+  scan_mysql_environment
+  printf '\n连接来源：\n'
+  printf '  1) 宿主机客户端（本机 TCP / Unix Socket / 远程 MySQL）\n'
+  printf '  2) Docker 容器内客户端（容器内本地 Socket）\n'
+  default_choice=1
+  [[ "$MYSQL_MODE" == "docker" ]] && default_choice=2
+  prompt_choice choice "请选择连接来源" 1 2 "$default_choice"
+  if [[ "$choice" -eq 1 ]]; then
+    MYSQL_MODE="host"
+    if ! mysql_host_client_binary >/dev/null 2>&1 || ! mysql_host_dump_binary >/dev/null 2>&1; then
+      warn "宿主机缺少完整的 MySQL/MariaDB 客户端工具。"
+      prompt_yes_no install_client "是否现在自动安装 default-mysql-client" 1
+      [[ "$install_client" -eq 1 ]] || die "没有客户端工具，无法配置宿主机/远程 MySQL 备份。"
+      install_mysql_client_interactive
+    fi
+    printf '\n  1) TCP（可用于本机或远程数据库）\n'
+    printf '  2) Unix Socket（适合本机数据库）\n'
+    connection_choice=1
+    [[ "$MYSQL_CONNECTION" == "socket" ]] && connection_choice=2
+    prompt_choice choice "请选择连接协议" 1 2 "$connection_choice"
+    if [[ "$choice" -eq 1 ]]; then
+      MYSQL_CONNECTION="tcp"
+      prompt_text input_value "MySQL 主机名或 IP" "$MYSQL_HOST" 1
+      [[ "$input_value" =~ ^[A-Za-z0-9._:-]+$ ]] || die "MySQL 主机名或 IP 格式无效。"
+      MYSQL_HOST="$input_value"
+      prompt_uint_range MYSQL_PORT "MySQL TCP 端口" "$MYSQL_PORT" 65535
+      [[ "$MYSQL_PORT" -ge 1 ]] || die "MySQL 端口不能为 0。"
+    else
+      MYSQL_CONNECTION="socket"
+      if [[ ! -S "$MYSQL_SOCKET" ]]; then
+        for input_value in /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /tmp/mysql.sock; do
+          if [[ -S "$input_value" ]]; then MYSQL_SOCKET="$input_value"; break; fi
+        done
+      fi
+      prompt_text input_value "MySQL Unix Socket 路径" "$MYSQL_SOCKET" 1
+      input_value="$(normalize_absolute_path "$input_value")"
+      is_safe_absolute_path "$input_value" || die "Socket 必须是不含空格和 .. 的绝对路径。"
+      [[ -S "$input_value" ]] || die "没有找到 Unix Socket：$input_value"
+      MYSQL_SOCKET="$input_value"
+    fi
+  else
+    MYSQL_MODE="docker"
+    MYSQL_CONNECTION="socket"
+    command -v docker >/dev/null 2>&1 || die "未找到 Docker。"
+    detected="$(detect_single_mysql_container 2>/dev/null || true)"
+    [[ -n "$detected" ]] || detected="${MYSQL_CONTAINER:-mysql}"
+    prompt_text input_value "MySQL/MariaDB Docker 容器名" "$detected" 1
+    [[ "$input_value" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Docker 容器名格式无效。"
+    docker inspect "$input_value" >/dev/null 2>&1 || die "没有找到容器：$input_value"
+    MYSQL_CONTAINER="$input_value"
+  fi
+  prompt_text input_value "数据库备份任务名称" "$MYSQL_TASK_NAME" 1
+  is_safe_display_name "$input_value" || die "任务名称必须是 1 到 80 个可见字符。"
+  MYSQL_TASK_NAME="$input_value"
+  prompt_text input_value "MySQL 用户名" "$MYSQL_USER" 1
+  [[ "$input_value" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "MySQL 用户名格式无效。"
+  MYSQL_USER="$input_value"
+  has_password=1
+  [[ -z "$MYSQL_PASSWORD" ]] && has_password=0
+  prompt_yes_no has_password "该 MySQL 账户是否使用密码" "$has_password"
+  if [[ "$has_password" -eq 1 ]]; then
+    prompt_secret MYSQL_PASSWORD "MySQL 密码" "$MYSQL_PASSWORD"
+  else
+    MYSQL_PASSWORD=""
+  fi
+  CURRENT_STEP="测试 MySQL 连接"
+  version="$(mysql_query 'SELECT VERSION();')" || die "无法连接 MySQL，请核对连接信息。"
+  success "MySQL 连接成功，服务端版本：$version"
+  available="$(mysql_list_databases)" || die "连接成功，但当前账户无权读取数据库列表。"
+  printf '\n当前账户可见数据库：\n'
+  index=0
+  while IFS= read -r database; do
+    [[ -n "$database" ]] || continue
+    index="$((index + 1))"
+    printf '  %2d) %s\n' "$index" "$database"
+  done <<< "$available"
+  printf '\n备份范围：\n'
+  printf '  1) 指定一个或多个数据库\n'
+  printf '  2) 全部业务数据库（自动排除 information_schema、performance_schema、mysql、sys）\n'
+  printf '  3) 全实例（包含系统库与账户权限数据，需要较高权限）\n'
+  case "$MYSQL_DATABASE_MODE" in selected) selection_default=1;; business) selection_default=2;; all) selection_default=3;; esac
+  prompt_choice choice "请选择备份范围" 1 3 "$selection_default"
+  case "$choice" in
+    1)
+      prompt_text input_value "数据库名，多个请用英文逗号分隔" "$MYSQL_DATABASES" 1
+      input_value="${input_value//[[:space:]]/}"
+      valid_mysql_database_selection "$input_value" \
+        || die "数据库名仅支持常用字母、数字、下划线、点、美元符和连字符，并用英文逗号分隔；虚拟库 information_schema/performance_schema 不能导出。"
+      MYSQL_DATABASE_MODE="selected"
+      MYSQL_DATABASES="$input_value"
+      ;;
+    2) MYSQL_DATABASE_MODE="business"; MYSQL_DATABASES="" ;;
+    3) MYSQL_DATABASE_MODE="all"; MYSQL_DATABASES="" ;;
+  esac
+  CURRENT_STEP="检查 MySQL 备份源"
+  validate_mysql_source
+  success "MySQL 备份源检查通过：$(mysql_database_mode_label)"
+}
+
 choose_backup_type_interactive() {
   local choice default_choice=1
-  [[ "$BACKUP_TYPE" == "komari" ]] && default_choice=2
-  heading "选择要备份的业务"
+  case "$BACKUP_TYPE" in
+    komari) default_choice=2 ;;
+    directory) default_choice=3 ;;
+    mysql) default_choice=4 ;;
+  esac
+  heading "选择要备份的任务类型"
   printf '  1) 发卡备份：Dujiao-Next（数据库、上传文件和配置）\n'
   printf '  2) 探针备份：Komari（Docker /app/data 完整数据）\n'
-  prompt_choice choice "请选择" 1 2 "$default_choice"
-  if [[ "$choice" -eq 1 ]]; then
-    BACKUP_TYPE="dujiao"
-    choose_deployment_interactive
-  else
-    BACKUP_TYPE="komari"
-    choose_komari_interactive
-  fi
+  printf '  3) 自定义目录：备份任意指定目录的全部普通文件\n'
+  printf '  4) MySQL 数据库：自动扫描本机/容器并执行一致性逻辑备份\n'
+  prompt_choice choice "请选择" 1 4 "$default_choice"
+  case "$choice" in
+    1) BACKUP_TYPE="dujiao"; choose_deployment_interactive ;;
+    2) BACKUP_TYPE="komari"; choose_komari_interactive ;;
+    3) BACKUP_TYPE="directory"; choose_custom_directory_interactive ;;
+    4) BACKUP_TYPE="mysql"; choose_mysql_interactive ;;
+  esac
 }
 
 configure_current_backup_source_interactive() {
   case "$BACKUP_TYPE" in
     dujiao) choose_deployment_interactive ;;
     komari) choose_komari_interactive ;;
+    directory) choose_custom_directory_interactive ;;
+    mysql) choose_mysql_interactive ;;
     *) die "未知备份类型：$BACKUP_TYPE" ;;
   esac
 }
@@ -786,6 +1424,8 @@ validate_backup_source() {
   case "$BACKUP_TYPE" in
     dujiao) validate_deployment ;;
     komari) validate_komari_deployment ;;
+    directory) validate_custom_directory ;;
+    mysql) validate_mysql_source ;;
     *) die "未知备份类型：$BACKUP_TYPE" ;;
   esac
 }
@@ -1120,7 +1760,7 @@ write_systemd_units() {
   CURRENT_STEP="写入 systemd 定时任务"
   cat > "$SERVICE_FILE" <<SERVICE
 [Unit]
-Description=Dujiao-Next or Komari complete backup
+Description=Server Backup Manager task
 After=docker.service network-online.target
 Wants=network-online.target
 
@@ -1137,7 +1777,7 @@ TimeoutStartSec=infinity
 SERVICE
   cat > "$TIMER_FILE" <<TIMER
 [Unit]
-Description=Run application backup every $(format_interval)
+Description=Run Server Backup Manager every $(format_interval)
 
 [Timer]
 OnActiveSec=${seconds}s
@@ -1349,7 +1989,7 @@ valid_archive_name() {
 }
 
 valid_supported_archive_name() {
-  [[ "$1" =~ ^(dujiao-next|komari)-[0-9]{8}-[0-9]{6}[.]tar$ ]]
+  [[ "$1" =~ ^(dujiao-next|komari|directory|mysql)-[0-9]{8}-[0-9]{6}[.]tar$ ]]
 }
 
 archive_marker() {
@@ -1446,6 +2086,7 @@ create_dujiao_archive() {
   chmod 0600 "$partial"
   mv -f -- "$partial" "$archive_path"
   ACTIVE_PARTIAL=""
+  CREATED_ARCHIVE="$archive_path"
   success "本地完整备份已生成：$archive_path（$(stat -c %s "$archive_path") 字节）"
 }
 
@@ -1517,13 +2158,170 @@ create_komari_archive() {
   chmod 0600 "$partial"
   mv -f -- "$partial" "$archive_path"
   ACTIVE_PARTIAL=""
+  CREATED_ARCHIVE="$archive_path"
   success "Komari 本地完整备份已生成：$archive_path（$(stat -c %s "$archive_path") 字节）"
+}
+
+create_directory_archive() {
+  local stamp archive_name archive_path work partial unexpected
+  local file_count source_bytes
+  CURRENT_STEP="创建自定义目录本地归档"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  archive_name="directory-$stamp.tar"
+  archive_path="$BACKUP_DIR/$archive_name"
+  while [[ -e "$archive_path" ]]; do
+    sleep 1
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    archive_name="directory-$stamp.tar"
+    archive_path="$BACKUP_DIR/$archive_name"
+  done
+  work="$(mktemp -d "$TMP_DIR/backup-directory-$stamp.XXXXXX")"
+  register_temp "$work"
+  partial="$BACKUP_DIR/.$archive_name.partial"
+  ACTIVE_PARTIAL="$partial"
+  info "开始创建自定义目录备份：$archive_name"
+  unexpected="$(find -P "$CUSTOM_DIR" ! -type d ! -type f -print -quit)"
+  [[ -z "$unexpected" ]] || die "归档前发现符号链接或特殊文件：$unexpected"
+  while IFS= read -r -d '' unexpected; do
+    [[ "$unexpected" != *[[:cntrl:]]* ]] \
+      || die "归档前发现包含控制字符的文件名：$unexpected"
+  done < <(find -P "$CUSTOM_DIR" -mindepth 1 -print0)
+  file_count="$(find -P "$CUSTOM_DIR" -type f | wc -l | tr -d ' ')"
+  source_bytes="$(du -sb -- "$CUSTOM_DIR" | awk '{print $1}')"
+  CURRENT_STEP="打包自定义目录 $CUSTOM_DIR"
+  tar -C "$CUSTOM_DIR" -czf "$work/directory.tar.gz" -- .
+  tar -tzf "$work/directory.tar.gz" >/dev/null
+  validate_tar_member_types "$work/directory.tar.gz" gzip "-d" \
+    || die "自定义目录归档中出现符号链接或特殊文件。"
+  validate_inner_tar_paths "$work/directory.tar.gz" directory \
+    || die "自定义目录归档中出现不安全路径。"
+  {
+    printf 'backup_manager_version=%s\n' "$VERSION"
+    printf 'backup_format=1\n'
+    printf 'created_at=%s\n' "$(now)"
+    printf 'hostname=%s\n' "$(hostname)"
+    printf 'application=custom-directory\n'
+    printf 'task_name=%s\n' "$CUSTOM_DIR_NAME"
+    printf 'source_directory=%s\n' "$CUSTOM_DIR"
+    printf 'payload=directory.tar.gz\n'
+    printf 'file_count=%s\n' "$file_count"
+    printf 'source_bytes=%s\n' "$source_bytes"
+    printf 'symlink_policy=reject\n'
+  } > "$work/manifest.txt"
+  CURRENT_STEP="生成并核对自定义目录备份校验和"
+  (
+    cd "$work"
+    sha256sum directory.tar.gz manifest.txt > SHA256SUMS
+    sha256sum -c SHA256SUMS >/dev/null
+  )
+  CURRENT_STEP="生成最终自定义目录 TAR 备份包"
+  tar -C "$work" -cf "$partial" directory.tar.gz manifest.txt SHA256SUMS
+  tar -tf "$partial" >/dev/null
+  chmod 0600 "$partial"
+  mv -f -- "$partial" "$archive_path"
+  ACTIVE_PARTIAL=""
+  CREATED_ARCHIVE="$archive_path"
+  success "自定义目录备份已生成：$archive_path（$(stat -c %s "$archive_path") 字节）"
+}
+
+create_mysql_archive() {
+  local stamp archive_name archive_path work partial database_list server_version
+  local dump_bytes list_file
+  local -a databases dump_args
+  CURRENT_STEP="创建 MySQL 一致性逻辑备份"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  archive_name="mysql-$stamp.tar"
+  archive_path="$BACKUP_DIR/$archive_name"
+  while [[ -e "$archive_path" ]]; do
+    sleep 1
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    archive_name="mysql-$stamp.tar"
+    archive_path="$BACKUP_DIR/$archive_name"
+  done
+  work="$(mktemp -d "$TMP_DIR/backup-mysql-$stamp.XXXXXX")"
+  register_temp "$work"
+  partial="$BACKUP_DIR/.$archive_name.partial"
+  ACTIVE_PARTIAL="$partial"
+  list_file="$work/databases.list"
+  mysql_database_names_for_backup > "$list_file"
+  if [[ -n "$(sort "$list_file" | uniq -d)" ]]; then
+    die "MySQL 数据库选择中存在重复名称，请修改任务配置。"
+  fi
+  mapfile -t databases < "$list_file"
+  [[ "${#databases[@]}" -gt 0 ]] || die "没有可备份的 MySQL 数据库。"
+  if [[ "$MYSQL_DATABASE_MODE" != "all" ]]; then
+    for database_list in "${databases[@]}"; do
+      valid_mysql_database_selection "$database_list" \
+        || die "数据库名称无法安全传给导出工具：$database_list；请改为指定数据库模式并使用常规名称。"
+    done
+  fi
+  server_version="$(mysql_query 'SELECT VERSION();')"
+  for database_list in "${databases[@]}"; do
+    [[ -n "$(mysql_query "SELECT 1 FROM information_schema.tables WHERE table_schema=$(mysql_sql_quote "$database_list") AND engine NOT IN ('InnoDB','MEMORY') LIMIT 1;" 2>/dev/null)" ]] \
+      && warn "数据库 $database_list 含非 InnoDB/MEMORY 表；--single-transaction 无法保证这些表的并发写入一致性。"
+  done
+  database_list="$(IFS=,; printf '%s' "${databases[*]}")"
+  dump_args=(
+    --single-transaction
+    --quick
+    --routines
+    --events
+    --triggers
+    --hex-blob
+    --default-character-set=utf8mb4
+  )
+  mysql_dump_supports_option 'column-statistics' && dump_args+=(--column-statistics=0)
+  mysql_dump_supports_option 'no-tablespaces' && dump_args+=(--no-tablespaces)
+  if [[ "$MYSQL_DATABASE_MODE" == "all" ]]; then
+    dump_args+=(--all-databases)
+  else
+    dump_args+=(--databases "${databases[@]}")
+  fi
+  info "开始导出 MySQL：$(mysql_database_mode_label)"
+  CURRENT_STEP="执行 MySQL 一致性逻辑导出"
+  run_mysql_tool dump "${dump_args[@]}" | gzip -6 > "$work/database.sql.gz"
+  [[ -s "$work/database.sql.gz" ]] || die "MySQL 导出文件为空。"
+  gzip -t "$work/database.sql.gz" || die "MySQL 压缩 SQL 文件校验失败。"
+  dump_bytes="$(gzip -cd "$work/database.sql.gz" | wc -c | tr -d ' ')"
+  [[ "$dump_bytes" -gt 0 ]] || die "MySQL SQL 导出内容为空。"
+  {
+    printf 'backup_manager_version=%s\n' "$VERSION"
+    printf 'backup_format=1\n'
+    printf 'created_at=%s\n' "$(now)"
+    printf 'hostname=%s\n' "$(hostname)"
+    printf 'application=mysql\n'
+    printf 'task_name=%s\n' "$MYSQL_TASK_NAME"
+    printf 'server_version=%s\n' "$server_version"
+    printf 'connection_mode=%s\n' "$MYSQL_MODE"
+    printf 'database_mode=%s\n' "$MYSQL_DATABASE_MODE"
+    printf 'databases=%s\n' "$database_list"
+    printf 'dump_file=database.sql.gz\n'
+    printf 'dump_uncompressed_bytes=%s\n' "$dump_bytes"
+    printf 'consistency=single-transaction\n'
+    printf 'includes=routines,events,triggers\n'
+  } > "$work/manifest.txt"
+  CURRENT_STEP="生成并核对 MySQL 备份校验和"
+  (
+    cd "$work"
+    sha256sum database.sql.gz manifest.txt > SHA256SUMS
+    sha256sum -c SHA256SUMS >/dev/null
+  )
+  CURRENT_STEP="生成最终 MySQL TAR 备份包"
+  tar -C "$work" -cf "$partial" database.sql.gz manifest.txt SHA256SUMS
+  tar -tf "$partial" >/dev/null
+  chmod 0600 "$partial"
+  mv -f -- "$partial" "$archive_path"
+  ACTIVE_PARTIAL=""
+  CREATED_ARCHIVE="$archive_path"
+  success "MySQL 数据库备份已生成：$archive_path（$(stat -c %s "$archive_path") 字节）"
 }
 
 create_archive() {
   case "$BACKUP_TYPE" in
     dujiao) create_dujiao_archive ;;
     komari) create_komari_archive ;;
+    directory) create_directory_archive ;;
+    mysql) create_mysql_archive ;;
     *) die "未知备份类型：$BACKUP_TYPE" ;;
   esac
 }
@@ -1767,17 +2565,23 @@ backup_command() {
     exit 0
   fi
   start_log_capture full
-  load_config || die "尚未安装或没有配置文件：$CONFIG_FILE"
+  load_config || die "尚未安装或没有有效配置文件：$CONFIG_FILE"
+  begin_backup_history
   heading "$(backup_type_label)完整备份开始"
   info "管理器版本：$VERSION"
-  info "备份类型：$(backup_type_label)；最多保留：$MAX_BACKUPS"
-  [[ "$BACKUP_TYPE" != "dujiao" ]] || info "Dujiao 部署模式：$DEPLOY_MODE"
+  info "备份任务：$(backup_type_label)；最多保留：$MAX_BACKUPS"
+  case "$BACKUP_TYPE" in
+    dujiao) info "Dujiao 部署模式：$DEPLOY_MODE" ;;
+    directory) info "自定义源目录：$CUSTOM_DIR" ;;
+    mysql) info "MySQL 范围：$(mysql_database_mode_label)" ;;
+  esac
   CURRENT_STEP="检查备份前环境"
   validate_backup_source
   create_archive
   sync_all_archives
   apply_retention
   success "本次完整备份全部成功。"
+  finish_backup_history "success" "$CREATED_ARCHIVE" "本地归档、远端同步和保留策略全部完成"
 }
 
 validate_tar_member_types() {
@@ -1803,16 +2607,24 @@ validate_tar_member_types() {
 validate_inner_tar_paths() {
   local archive="$1"
   local kind="$2"
-  local listing member count=0
+  local listing normalized_listing member count=0
   local env_count=0 config_count=0 compose_count=0 komari_db_count=0
   listing="$(mktemp "$TMP_DIR/tar-list.XXXXXX")"
+  normalized_listing="$(mktemp "$TMP_DIR/tar-normalized.XXXXXX")"
   register_temp "$listing"
+  register_temp "$normalized_listing"
   tar -tzf "$archive" > "$listing"
-  if sort "$listing" | uniq -d | grep -q .; then
+  if [[ -n "$(sort "$listing" | uniq -d)" ]]; then
     return 1
   fi
   while IFS= read -r member; do
     count="$((count + 1))"
+    if [[ "$kind" == "directory" ]]; then
+      case "$member" in
+        .|./) continue ;;
+        ./*) member="${member#./}" ;;
+      esac
+    fi
     [[ -n "$member" && "$member" != /* && "$member" != "." && "$member" != ./* \
       && "$member" != ".." && "$member" != ../* && "$member" != *"//"* \
       && "$member" != *"/./"* && "$member" != *"/." \
@@ -1829,6 +2641,9 @@ validate_inner_tar_paths() {
           *) return 1 ;;
         esac
         ;;
+      directory)
+        printf '%s\n' "$member" >> "$normalized_listing"
+        ;;
       komari-data)
         [[ "$member" == "data" || "$member" == "data/" || "$member" == data/* ]] || return 1
         case "$member" in
@@ -1839,6 +2654,9 @@ validate_inner_tar_paths() {
       *) return 1 ;;
     esac
   done < "$listing"
+  if [[ "$kind" == "directory" && -n "$(sort "$normalized_listing" | uniq -d)" ]]; then
+    return 1
+  fi
   if [[ "$kind" == "config" ]]; then
     [[ "$count" -eq 3 && "$env_count" -eq 1 && "$config_count" -eq 1 && "$compose_count" -eq 1 ]]
   elif [[ "$kind" == "komari-data" ]]; then
@@ -1879,10 +2697,10 @@ verify_dujiao_archive_file() {
     || die "备份包内的固定文件必须各出现一次。"
   tar --no-same-owner --no-same-permissions -xf "$archive" -C "$work"
   expected_checksum_files=("$database_file" uploads.tar.gz config.tar.gz manifest.txt)
-  if grep -Eqv '^[0-9a-fA-F]{64}  [A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
+  if grep -Eqv '^[0-9a-fA-F]{64} [ *][A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
     die "SHA256SUMS 格式不安全或不受支持。"
   fi
-  mapfile -t checksum_files < <(awk '{print $2}' "$work/SHA256SUMS")
+  mapfile -t checksum_files < <(awk '{name=$2; sub(/^\*/, "", name); print name}' "$work/SHA256SUMS")
   [[ "${#checksum_files[@]}" -eq 4 ]] || die "SHA256SUMS 必须正好包含 4 条记录。"
   for expected in "${expected_checksum_files[@]}"; do
     archive_array_contains "$expected" "${checksum_files[@]}" || die "SHA256SUMS 缺少文件：$expected"
@@ -1936,10 +2754,10 @@ verify_komari_archive_file() {
     || die "Komari 备份包内的固定文件必须各出现一次。"
   tar --no-same-owner --no-same-permissions -xf "$archive" -C "$work"
   expected_checksum_files=(data.tar.gz manifest.txt)
-  if grep -Eqv '^[0-9a-fA-F]{64}  [A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
+  if grep -Eqv '^[0-9a-fA-F]{64} [ *][A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
     die "Komari SHA256SUMS 格式不安全或不受支持。"
   fi
-  mapfile -t checksum_files < <(awk '{print $2}' "$work/SHA256SUMS")
+  mapfile -t checksum_files < <(awk '{name=$2; sub(/^\*/, "", name); print name}' "$work/SHA256SUMS")
   [[ "${#checksum_files[@]}" -eq 2 ]] || die "Komari SHA256SUMS 必须正好包含 2 条记录。"
   for expected in "${expected_checksum_files[@]}"; do
     archive_array_contains "$expected" "${checksum_files[@]}" || die "Komari SHA256SUMS 缺少文件：$expected"
@@ -1965,6 +2783,96 @@ verify_komari_archive_file() {
   success "Komari 备份包完整性校验通过：$archive"
 }
 
+verify_directory_archive_file() {
+  local archive="$1"
+  local work member payload_found=0 manifest_found=0 checksums_found=0
+  local expected checksum_name
+  local -a members checksum_files expected_checksum_files
+  [[ -f "$archive" ]] || die "备份文件不存在：$archive"
+  work="$(mktemp -d "$TMP_DIR/verify-directory.XXXXXX")"
+  register_temp "$work"
+  CURRENT_STEP="检查自定义目录备份外层结构"
+  validate_tar_member_types "$archive" plain "-" || die "自定义目录外层 TAR 含有非普通文件条目。"
+  mapfile -t members < <(tar -tf "$archive")
+  [[ "${#members[@]}" -eq 3 ]] || die "自定义目录备份应包含 3 个文件，实际为 ${#members[@]} 个。"
+  for member in "${members[@]}"; do
+    case "$member" in
+      directory.tar.gz) payload_found="$((payload_found + 1))" ;;
+      manifest.txt) manifest_found="$((manifest_found + 1))" ;;
+      SHA256SUMS) checksums_found="$((checksums_found + 1))" ;;
+      *) die "自定义目录备份包含异常文件：$member" ;;
+    esac
+  done
+  [[ "$payload_found" -eq 1 && "$manifest_found" -eq 1 && "$checksums_found" -eq 1 ]] \
+    || die "自定义目录备份内的固定文件必须各出现一次。"
+  tar --no-same-owner --no-same-permissions -xf "$archive" -C "$work"
+  expected_checksum_files=(directory.tar.gz manifest.txt)
+  if grep -Eqv '^[0-9a-fA-F]{64} [ *][A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
+    die "自定义目录 SHA256SUMS 格式不安全或不受支持。"
+  fi
+  mapfile -t checksum_files < <(awk '{name=$2; sub(/^\*/, "", name); print name}' "$work/SHA256SUMS")
+  [[ "${#checksum_files[@]}" -eq 2 ]] || die "自定义目录 SHA256SUMS 必须正好包含 2 条记录。"
+  for expected in "${expected_checksum_files[@]}"; do
+    archive_array_contains "$expected" "${checksum_files[@]}" || die "SHA256SUMS 缺少文件：$expected"
+  done
+  for checksum_name in "${checksum_files[@]}"; do
+    archive_array_contains "$checksum_name" "${expected_checksum_files[@]}" || die "SHA256SUMS 含有异常文件：$checksum_name"
+  done
+  (cd "$work" && sha256sum -c SHA256SUMS)
+  grep -qx 'application=custom-directory' "$work/manifest.txt" || die "manifest 缺少自定义目录类型标记。"
+  grep -qx 'backup_format=1' "$work/manifest.txt" || die "自定义目录备份格式不受支持。"
+  validate_tar_member_types "$work/directory.tar.gz" gzip "-d" \
+    || die "directory.tar.gz 含有符号链接或特殊文件。"
+  validate_inner_tar_paths "$work/directory.tar.gz" directory \
+    || die "directory.tar.gz 含有不安全路径。"
+  success "自定义目录备份包完整性校验通过：$archive"
+}
+
+verify_mysql_archive_file() {
+  local archive="$1"
+  local work member dump_found=0 manifest_found=0 checksums_found=0
+  local expected checksum_name dump_bytes
+  local -a members checksum_files expected_checksum_files
+  [[ -f "$archive" ]] || die "备份文件不存在：$archive"
+  work="$(mktemp -d "$TMP_DIR/verify-mysql.XXXXXX")"
+  register_temp "$work"
+  CURRENT_STEP="检查 MySQL 备份外层结构"
+  validate_tar_member_types "$archive" plain "-" || die "MySQL 外层 TAR 含有非普通文件条目。"
+  mapfile -t members < <(tar -tf "$archive")
+  [[ "${#members[@]}" -eq 3 ]] || die "MySQL 备份应包含 3 个文件，实际为 ${#members[@]} 个。"
+  for member in "${members[@]}"; do
+    case "$member" in
+      database.sql.gz) dump_found="$((dump_found + 1))" ;;
+      manifest.txt) manifest_found="$((manifest_found + 1))" ;;
+      SHA256SUMS) checksums_found="$((checksums_found + 1))" ;;
+      *) die "MySQL 备份包含异常文件：$member" ;;
+    esac
+  done
+  [[ "$dump_found" -eq 1 && "$manifest_found" -eq 1 && "$checksums_found" -eq 1 ]] \
+    || die "MySQL 备份内的固定文件必须各出现一次。"
+  tar --no-same-owner --no-same-permissions -xf "$archive" -C "$work"
+  expected_checksum_files=(database.sql.gz manifest.txt)
+  if grep -Eqv '^[0-9a-fA-F]{64} [ *][A-Za-z0-9._-]+$' "$work/SHA256SUMS"; then
+    die "MySQL SHA256SUMS 格式不安全或不受支持。"
+  fi
+  mapfile -t checksum_files < <(awk '{name=$2; sub(/^\*/, "", name); print name}' "$work/SHA256SUMS")
+  [[ "${#checksum_files[@]}" -eq 2 ]] || die "MySQL SHA256SUMS 必须正好包含 2 条记录。"
+  for expected in "${expected_checksum_files[@]}"; do
+    archive_array_contains "$expected" "${checksum_files[@]}" || die "SHA256SUMS 缺少文件：$expected"
+  done
+  for checksum_name in "${checksum_files[@]}"; do
+    archive_array_contains "$checksum_name" "${expected_checksum_files[@]}" || die "SHA256SUMS 含有异常文件：$checksum_name"
+  done
+  (cd "$work" && sha256sum -c SHA256SUMS)
+  grep -qx 'application=mysql' "$work/manifest.txt" || die "manifest 缺少 MySQL 类型标记。"
+  grep -qx 'backup_format=1' "$work/manifest.txt" || die "MySQL 备份格式不受支持。"
+  gzip -t "$work/database.sql.gz" || die "MySQL SQL 压缩流校验失败。"
+  dump_bytes="$(gzip -cd "$work/database.sql.gz" | wc -c | tr -d ' ')"
+  [[ "$dump_bytes" -gt 0 ]] || die "MySQL SQL 逻辑导出为空。"
+  success "MySQL SQL 压缩流和 SHA256 校验通过。"
+  success "MySQL 备份包完整性校验通过：$archive"
+}
+
 verify_archive_file() {
   local archive="$1"
   local name
@@ -1973,11 +2881,17 @@ verify_archive_file() {
   case "$name" in
     dujiao-next-*) verify_dujiao_archive_file "$archive" ;;
     komari-*) verify_komari_archive_file "$archive" ;;
+    directory-*) verify_directory_archive_file "$archive" ;;
+    mysql-*) verify_mysql_archive_file "$archive" ;;
     *)
       if tar -tf "$archive" | grep -qx 'data.tar.gz'; then
         verify_komari_archive_file "$archive"
       elif tar -tf "$archive" | grep -Eqx 'database[.](sqlite|dump)'; then
         verify_dujiao_archive_file "$archive"
+      elif tar -tf "$archive" | grep -qx 'directory.tar.gz'; then
+        verify_directory_archive_file "$archive"
+      elif tar -tf "$archive" | grep -qx 'database.sql.gz'; then
+        verify_mysql_archive_file "$archive"
       else
         die "无法根据文件名或包结构识别备份类型：$name"
       fi
@@ -1997,41 +2911,136 @@ verify_command() {
   verify_archive_file "$archive"
 }
 
-list_local_backups() {
-  local count total pattern other_count
+format_bytes() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || printf '%s B' "$bytes"
+  else
+    printf '%s B' "$bytes"
+  fi
+}
+
+archive_sync_status() {
+  local name="$1" target="$2" marker destination enabled
+  marker="$(archive_marker "$name" "$target")"
+  case "$target" in
+    oss) enabled="$OSS_ENABLED"; destination="$(oss_destination_id)" ;;
+    sftp) enabled="$SFTP_ENABLED"; destination="$(sftp_destination_id)" ;;
+  esac
+  if [[ -f "$marker" ]] && marker_matches "$marker" "$destination"; then
+    printf '已同步'
+  elif [[ -f "$marker" ]]; then
+    printf '历史目标'
+  elif [[ "$enabled" -eq 1 ]]; then
+    printf '未记录'
+  else
+    printf '未启用'
+  fi
+}
+
+format_history_duration() {
+  local started="$1" finished="$2" start_epoch finish_epoch seconds
+  start_epoch="$(date -d "$started" +%s 2>/dev/null || true)"
+  finish_epoch="$(date -d "$finished" +%s 2>/dev/null || true)"
+  if [[ "$start_epoch" =~ ^[0-9]+$ && "$finish_epoch" =~ ^[0-9]+$ \
+    && "$finish_epoch" -ge "$start_epoch" ]]; then
+    seconds="$((finish_epoch - start_epoch))"
+    printf '%02d:%02d:%02d' "$((seconds / 3600))" "$(((seconds % 3600) / 60))" "$((seconds % 60))"
+  else
+    printf '未知'
+  fi
+}
+
+show_execution_history() {
+  local run_id started finished type status archive size targets details task_name index=0 status_text duration
+  heading "最近备份执行记录"
+  if [[ ! -s "$HISTORY_FILE" ]]; then
+    printf '暂无结构化执行记录；升级前生成的归档仍会显示在本地归档历史中。\n'
+    return 0
+  fi
+  while IFS=$'\t' read -r run_id started finished type status archive size targets details task_name; do
+    [[ -n "$run_id" ]] || continue
+    index="$((index + 1))"
+    case "$status" in success) status_text="成功";; failed) status_text="失败";; *) status_text="$status";; esac
+    duration="$(format_history_duration "$started" "$finished")"
+    [[ -n "$task_name" ]] || task_name="$(backup_type_code_label "$type")"
+    printf '%2d) [%s] %s  %s（%s）\n' \
+      "$index" "$status_text" "$started" "$(backup_type_code_label "$type")" "$task_name"
+    printf '    完成：%s  耗时：%s  目标：%s\n' "$finished" "$duration" "$targets"
+    if [[ "$archive" != "-" ]]; then
+      printf '    归档：%s（%s）\n' "$archive" "$(format_bytes "$size")"
+    fi
+    printf '    说明：%s\n' "$details"
+  done < <(tail -n 30 "$HISTORY_FILE" | tac)
+}
+
+show_archive_history() {
+  local listing count total _epoch modified size name index=0 current oss_status sftp_status
+  ensure_runtime_dirs
+  listing="$(mktemp "$TMP_DIR/archive-history.XXXXXX")"
+  register_temp "$listing"
+  find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
+    \( -name 'dujiao-next-????????-??????.tar' \
+      -o -name 'komari-????????-??????.tar' \
+      -o -name 'directory-????????-??????.tar' \
+      -o -name 'mysql-????????-??????.tar' \) \
+    -printf '%T@\t%TY-%Tm-%Td %TH:%TM:%TS\t%s\t%f\n' | sort -nr > "$listing"
+  count="$(wc -l < "$listing" | tr -d ' ')"
+  total="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
+  heading "本地归档历史（共 $count 份，目录占用 ${total:-0}）"
+  if [[ "$count" -eq 0 ]]; then
+    printf '暂无本地备份归档。\n'
+    return 0
+  fi
+  printf '标记说明：* 为当前任务类型；OSS/SFTP 状态来自上传成功后的校验标记。\n\n'
+  while IFS=$'\t' read -r _epoch modified size name; do
+    [[ -n "$name" ]] || continue
+    index="$((index + 1))"
+    current=" "
+    valid_archive_name "$name" && current="*"
+    oss_status="$(archive_sync_status "$name" oss)"
+    sftp_status="$(archive_sync_status "$name" sftp)"
+    modified="${modified%%.*}"
+    printf '%s%2d) %-12s  %s  %9s\n' "$current" "$index" "$(archive_type_label "$name")" "$modified" "$(format_bytes "$size")"
+    printf '     文件：%s\n' "$name"
+    printf '     OSS：%-8s  SFTP：%s\n' "$oss_status" "$sftp_status"
+    [[ "$index" -lt 50 ]] || { printf '\n仅显示最新 50 份；完整目录：%s\n' "$BACKUP_DIR"; break; }
+  done < "$listing"
+}
+
+show_backup_history() {
+  require_root
   ensure_runtime_dirs
   load_config || die "尚未安装。"
-  pattern="$(current_archive_pattern)"
-  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')"
-  total="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
-  heading "$(backup_type_label)本地备份（$count 份，目录占用 ${total:-0}）"
-  find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-    -name "$pattern" -printf '%TY-%Tm-%Td %TH:%TM  %10s  %f\n' | sort
-  [[ "$count" -gt 0 ]] || printf '暂无本地备份。\n'
-  other_count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
-    \( -name 'dujiao-next-????????-??????.tar' -o -name 'komari-????????-??????.tar' \) \
-    ! -name "$pattern" | wc -l | tr -d ' ')"
-  [[ "$other_count" -eq 0 ]] || printf '\n另有 %s 份其他业务类型的历史备份；当前保留策略不会删除它们。\n' "$other_count"
+  show_execution_history
+  show_archive_history
+}
+
+list_local_backups() {
+  require_root
+  ensure_runtime_dirs
+  load_config || die "尚未安装。"
+  show_archive_history
 }
 
 list_remote_backups() {
-  local pattern
   require_root
+  ensure_runtime_dirs
   load_config || die "尚未安装。"
-  pattern="$(current_archive_pattern)"
   if [[ "$OSS_ENABLED" -eq 1 ]]; then
-    heading "阿里云 OSS：$(oss_destination_id)/"
+    heading "阿里云 OSS 归档历史：$(oss_destination_id)/"
     validate_oss_settings
     oss_export_environment
     ossutil ls "$(oss_destination_id)/"
   fi
   if [[ "$SFTP_ENABLED" -eq 1 ]]; then
-    heading "SFTP：$(sftp_destination_id)"
+    heading "SFTP 归档历史：$(sftp_destination_id)"
     validate_sftp_settings
-    sftp_ssh "for f in '$SFTP_REMOTE_DIR'/$pattern; do test -f \"\$f\" && stat -c '%y  %s  %n' \"\$f\"; done" || true
+    sftp_ssh "for p in dujiao-next komari directory mysql; do for f in '$SFTP_REMOTE_DIR'/\$p-????????-??????.tar; do test -f \"\$f\" && stat -c '%y  %s  %n' \"\$f\"; done; done" \
+      | sort -r || true
   fi
   if [[ "$OSS_ENABLED" -eq 0 && "$SFTP_ENABLED" -eq 0 ]]; then
-    warn "当前没有启用远端备份。"
+    warn "当前没有启用远端备份。请在统一配置中心启用 OSS、SFTP 或两者。"
   fi
 }
 
@@ -2054,44 +3063,99 @@ timer_status_text() {
   fi
 }
 
+print_backup_source_details() {
+  case "$BACKUP_TYPE" in
+    dujiao)
+      printf '任务名称       : Dujiao-Next 发卡完整备份\n'
+      printf '应用目录       : %s\n' "$APP_DIR"
+      printf '部署模式       : %s\n' "$DEPLOY_MODE"
+      if [[ "$DEPLOY_MODE" == "postgres" ]]; then
+        printf '数据库容器     : %s\n' "$PG_CONTAINER"
+      else
+        printf 'SQLite 数据库  : %s\n' "$DB_FILE"
+      fi
+      ;;
+    komari)
+      printf '任务名称       : Komari 探针完整备份\n'
+      printf 'Docker 容器    : %s\n' "$KOMARI_CONTAINER"
+      printf '宿主机数据     : %s\n' "$KOMARI_DATA_DIR"
+      printf '容器内挂载     : /app/data\n'
+      printf 'SQLite 数据库  : %s\n' "$KOMARI_DB_FILE"
+      ;;
+    directory)
+      printf '任务名称       : %s\n' "$CUSTOM_DIR_NAME"
+      printf '数据源类型     : 自定义目录\n'
+      printf '源目录         : %s\n' "$CUSTOM_DIR"
+      printf '文件安全策略   : 仅普通文件/目录，拒绝符号链接与特殊文件\n'
+      ;;
+    mysql)
+      printf '任务名称       : %s\n' "$MYSQL_TASK_NAME"
+      printf '数据源类型     : MySQL/MariaDB 逻辑备份\n'
+      if [[ "$MYSQL_MODE" == "docker" ]]; then
+        printf '连接方式       : Docker 容器内本地连接\n'
+        printf '数据库容器     : %s\n' "$MYSQL_CONTAINER"
+      elif [[ "$MYSQL_CONNECTION" == "socket" ]]; then
+        printf '连接方式       : 宿主机 Unix Socket\n'
+        printf 'Socket         : %s\n' "$MYSQL_SOCKET"
+      else
+        printf '连接方式       : TCP\n'
+        printf '数据库地址     : %s:%s\n' "$MYSQL_HOST" "$MYSQL_PORT"
+      fi
+      [[ "$MYSQL_MODE" == "host" ]] && printf '数据库协议     : %s\n' "$MYSQL_CONNECTION"
+      printf '数据库用户     : %s\n' "$MYSQL_USER"
+      printf '密码状态       : %s\n' "$([[ -n "$MYSQL_PASSWORD" ]] && printf '已安全保存（不显示）' || printf '无密码')"
+      printf '备份范围       : %s\n' "$(mysql_database_mode_label)"
+      printf '一致性策略     : single-transaction + routines/events/triggers\n'
+      ;;
+  esac
+}
+
 status_command() {
-  local count total latest last_result targets="" pattern
+  local count total latest targets last_record
+  local run_id started finished type status archive size run_targets details task_name status_text duration
   require_root
   ensure_runtime_dirs
   load_config || die "尚未安装。"
-  pattern="$(current_archive_pattern)"
-  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')"
+  count="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$(current_archive_pattern)" | wc -l | tr -d ' ')"
   total="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
-  latest="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$pattern" -printf '%f\n' | sort | tail -n 1)"
-  last_result="$(grep -E '\[(SUCCESS|ERROR)\]' "$LOG_FILE" 2>/dev/null | tail -n 1 || true)"
-  [[ "$OSS_ENABLED" -eq 1 ]] && targets="${targets}OSS "
-  [[ "$SFTP_ENABLED" -eq 1 ]] && targets="${targets}SFTP "
-  [[ -n "$targets" ]] || targets="仅本地"
-  heading "$PROGRAM_NAME 状态"
-  printf '程序版本      : %s\n' "$VERSION"
-  printf '安装目录      : %s\n' "$INSTALL_DIR"
-  printf '备份类型      : %s\n' "$(backup_type_label)"
-  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
-    printf 'Dujiao 目录   : %s\n' "$APP_DIR"
-    printf '部署模式      : %s\n' "$DEPLOY_MODE"
-  else
-    printf 'Komari 容器   : %s\n' "$KOMARI_CONTAINER"
-    printf 'Komari 数据   : %s -> /app/data\n' "$KOMARI_DATA_DIR"
-    printf 'Komari 数据库 : %s\n' "$KOMARI_DB_FILE"
-  fi
-  printf '备份目标      : %s\n' "$targets"
-  printf '最多保留      : %s 份\n' "$MAX_BACKUPS"
-  printf '本地备份      : %s 份，占用 %s\n' "$count" "${total:-0}"
-  printf '最新备份      : %s\n' "${latest:-无}"
-  printf '内置定时      : %s\n' "$(timer_status_text)"
+  latest="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f -name "$(current_archive_pattern)" -printf '%f\n' | sort | tail -n 1)"
+  targets="$(backup_targets_label)"
+  heading "当前备份任务"
+  printf '任务状态       : 已配置（每次运行前自动检查数据源）\n'
+  printf '任务类型       : %s\n' "$(backup_type_label)"
+  printf '归档文件规则   : %s\n' "$(current_archive_pattern)"
+  print_backup_source_details
+  heading "存储目标与保留策略"
+  printf '本地存储       : 已启用 -> %s\n' "$BACKUP_DIR"
   if [[ "$OSS_ENABLED" -eq 1 ]]; then
-    printf 'OSS AccessKey : %s\n' "$(mask_access_key "$OSS_ACCESS_KEY_ID")"
-    printf 'OSS 位置      : %s/\n' "$(oss_destination_id)"
+    printf '阿里云 OSS     : 已启用 -> %s/\n' "$(oss_destination_id)"
+  else
+    printf '阿里云 OSS     : 未启用\n'
   fi
   if [[ "$SFTP_ENABLED" -eq 1 ]]; then
-    printf 'SFTP 位置     : %s\n' "$(sftp_destination_id)"
+    printf 'SFTP/SSH       : 已启用 -> %s\n' "$(sftp_destination_id)"
+  else
+    printf 'SFTP/SSH       : 未启用\n'
   fi
-  printf '最近结果      : %s\n' "${last_result:-暂无记录}"
+  printf '实际写入目标   : %s\n' "$targets"
+  printf '保留数量       : 当前任务类型最多 %s 份\n' "$MAX_BACKUPS"
+  printf '自动备份       : %s\n' "$(timer_status_text)"
+  heading "当前任务概览"
+  printf '本地归档       : %s 份（整个归档目录占用 %s）\n' "$count" "${total:-0}"
+  printf '最新归档       : %s\n' "${latest:-无}"
+  last_record="$(awk -F '\t' -v wanted="$BACKUP_TYPE" '$4 == wanted {line=$0} END {print line}' "$HISTORY_FILE" 2>/dev/null || true)"
+  if [[ -n "$last_record" ]]; then
+    IFS=$'\t' read -r run_id started finished type status archive size run_targets details task_name <<< "$last_record"
+    [[ "$status" == "success" ]] && status_text="成功" || status_text="失败"
+    duration="$(format_history_duration "$started" "$finished")"
+    printf '最近执行       : [%s] %s -> %s（耗时 %s）\n' \
+      "$status_text" "$started" "$finished" "$duration"
+    printf '最近任务       : %s\n' "${task_name:-$(backup_task_name)}"
+    printf '最近目标       : %s\n' "$run_targets"
+    printf '最近说明       : %s\n' "$details"
+  else
+    printf '最近执行       : 暂无结构化记录\n'
+  fi
   if systemd_available && [[ "$TIMER_ENABLED" -eq 1 ]]; then
     printf '\nsystemd 下一次运行：\n'
     systemctl list-timers dujiao-backup.timer --no-pager || true
@@ -2182,17 +3246,8 @@ show_configuration_summary() {
   heading "当前配置摘要（敏感信息已脱敏）"
   printf '配置文件           : %s（%s）\n' "$CONFIG_FILE" "$config_mode"
   printf '备份类型           : %s\n' "$(backup_type_label)"
-  if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
-    printf 'Dujiao 目录        : %s\n' "$APP_DIR"
-    printf '部署模式           : %s\n' "$DEPLOY_MODE"
-    [[ "$DEPLOY_MODE" == "postgres" ]] && printf 'PostgreSQL 容器    : %s\n' "$PG_CONTAINER"
-  else
-    printf 'Komari 容器        : %s\n' "$KOMARI_CONTAINER"
-    printf 'Komari 宿主机目录  : %s\n' "$KOMARI_DATA_DIR"
-    printf 'Komari 容器内目录  : /app/data\n'
-    printf 'Komari SQLite      : %s\n' "$KOMARI_DB_FILE"
-  fi
-  printf '最多保留           : %s 份\n' "$MAX_BACKUPS"
+  print_backup_source_details
+  printf '最多保留           : %s 份（按当前任务类型独立计算）\n' "$MAX_BACKUPS"
   printf '\nOSS 状态           : %s\n' "$(enabled_status_text "$OSS_ENABLED")"
   printf 'OSS AccessKey ID   : %s\n' "$(mask_access_key "$OSS_ACCESS_KEY_ID")"
   printf 'OSS AccessKey 密钥 : %s\n' "$(secret_status_text "$OSS_ACCESS_KEY_SECRET")"
@@ -2449,16 +3504,12 @@ backup_source_configuration_menu() {
   local choice previous_type
   while true; do
     load_config || die "尚未安装。"
-    heading "发卡 / 探针备份设置"
-    printf '当前类型：%s\n' "$(backup_type_label)"
-    if [[ "$BACKUP_TYPE" == "dujiao" ]]; then
-      printf '当前数据：%s（%s）\n\n' "$APP_DIR" "$DEPLOY_MODE"
-    else
-      printf '当前数据：%s -> %s:/app/data\n\n' "$KOMARI_DATA_DIR" "$KOMARI_CONTAINER"
-    fi
-    printf '  1) 修改当前业务的数据源设置\n'
-    printf '  2) 选择/切换发卡备份或探针备份\n'
-    printf '  3) 检查当前数据源和 Docker 挂载\n'
+    heading "备份任务类型与数据源"
+    printf '当前类型：%s\n\n' "$(backup_type_label)"
+    print_backup_source_details
+    printf '\n  1) 修改当前任务的数据源设置\n'
+    printf '  2) 选择/切换任务类型（发卡、探针、自定义目录、MySQL）\n'
+    printf '  3) 立即检查当前数据源可用性\n'
     printf '  4) 查看完整配置摘要（脱敏）\n'
     printf '  0) 返回统一配置中心\n'
     prompt_choice choice "请选择" 0 4 0
@@ -2472,12 +3523,13 @@ backup_source_configuration_menu() {
         previous_type="$BACKUP_TYPE"
         choose_backup_type_interactive
         save_config
-        success "备份类型已保存为：$(backup_type_label)"
+        success "备份任务类型已保存为：$(backup_type_label)"
         if [[ "$previous_type" != "$BACKUP_TYPE" ]]; then
-          warn "原业务的本地和远端备份会保留；当前保留策略只管理新选择的业务类型。"
+          warn "原任务的本地和远端归档会保留；保留策略只管理当前任务类型。"
         fi
         ;;
       3)
+        [[ "$BACKUP_TYPE" != "mysql" ]] || scan_mysql_environment
         validate_backup_source
         success "$(backup_type_label)数据源检查通过。"
         ;;
@@ -2512,11 +3564,11 @@ configuration_menu() {
   while true; do
     load_config || die "尚未安装。"
     heading "统一配置中心"
-    printf '业务：%s  |  保留：%s份  |  OSS：%s  |  SFTP：%s  |  定时：%s\n\n' \
+    printf '任务：%s  |  保留：%s份  |  OSS：%s  |  SFTP：%s  |  定时：%s\n\n' \
       "$(backup_type_label)" "$MAX_BACKUPS" "$(enabled_status_text "$OSS_ENABLED")" \
       "$(enabled_status_text "$SFTP_ENABLED")" "$(timer_status_text)"
     printf '  1) 查看全部配置摘要（脱敏）\n'
-    printf '  2) 管理发卡/探针备份类型和数据源\n'
+    printf '  2) 管理备份任务类型和数据源（含目录/MySQL）\n'
     printf '  3) 修改备份保留数量\n'
     printf '  4) 管理阿里云 OSS 全部参数\n'
     printf '  5) 管理 SFTP/SSH 全部参数\n'
@@ -2617,16 +3669,18 @@ menu() {
   while true; do
     load_config || die "配置文件读取失败：$CONFIG_FILE"
     heading "$PROGRAM_NAME v$VERSION"
-    printf '当前业务：%s\n\n' "$(backup_type_label)"
-    printf '  1) 立即执行当前业务完整备份\n'
-    printf '  2) 查看运行状态\n'
-    printf '  3) 统一配置中心（发卡/探针/OSS/SFTP/定时）\n'
+    printf '当前任务：%s\n' "$(backup_type_label)"
+    printf '备份目标：%s  |  保留：%s份  |  定时：%s\n\n' \
+      "$(backup_targets_label)" "$MAX_BACKUPS" "$(timer_status_text)"
+    printf '  1) 立即执行当前备份任务\n'
+    printf '  2) 查看当前备份任务（数据源/目标/计划/最近结果）\n'
+    printf '  3) 统一配置中心（任务类型/目录/MySQL/OSS/SFTP/定时）\n'
     printf '  4) 定时任务快捷管理\n'
-    printf '  5) 查看本地备份\n'
-    printf '  6) 查看远端备份\n'
+    printf '  5) 查看备份历史（执行记录 + 全部本地归档）\n'
+    printf '  6) 查看远端归档历史（OSS/SFTP）\n'
     printf '  7) 校验备份包\n'
     printf '  8) 测试远端连接\n'
-    printf '  9) 查看当前业务最近日志\n'
+    printf '  9) 查看最近 100 行运行日志\n'
     printf ' 10) 检查并执行在线升级\n'
     printf ' 11) 显示宝塔计划任务命令\n'
     printf ' 12) 卸载管理器\n'
@@ -2637,10 +3691,10 @@ menu() {
       2) run_child_command status ;;
       3) run_child_command configure ;;
       4) run_child_command timer-menu ;;
-      5) list_local_backups ;;
+      5) run_child_command history ;;
       6) run_child_command list-remote ;;
       7)
-        prompt_text archive "备份文件完整路径（直接回车校验最新一份）" "" 0
+        prompt_text archive "备份文件完整路径（直接回车校验当前任务最新一份）" "" 0
         if [[ -n "$archive" ]]; then
           run_child_command verify "$archive"
         else
@@ -2773,6 +3827,30 @@ self_test() {
   [[ "$(current_archive_pattern)" == "komari-????????-??????.tar" ]]
   valid_archive_name "komari-20260815-123456.tar"
   if valid_archive_name "dujiao-next-20260815-123456.tar"; then return 1; fi
+  BACKUP_TYPE="directory"
+  CUSTOM_DIR_NAME="站点文件"
+  [[ "$(backup_type_label)" == "自定义目录备份（站点文件）" ]]
+  [[ "$(current_archive_pattern)" == "directory-????????-??????.tar" ]]
+  valid_archive_name "directory-20260815-123456.tar"
+  valid_supported_archive_name "directory-20260815-123456.tar"
+  BACKUP_TYPE="mysql"
+  MYSQL_TASK_NAME="业务主库"
+  MYSQL_DATABASE_MODE="selected"
+  MYSQL_DATABASES="app,analytics"
+  [[ "$(backup_type_label)" == "MySQL 数据库备份（业务主库）" ]]
+  [[ "$(current_archive_pattern)" == "mysql-????????-??????.tar" ]]
+  [[ "$(mysql_database_mode_label)" == "指定数据库：app,analytics" ]]
+  valid_archive_name "mysql-20260815-123456.tar"
+  valid_supported_archive_name "mysql-20260815-123456.tar"
+  valid_mysql_database_selection "app,analytics-db"
+  if valid_mysql_database_selection "app,bad name"; then return 1; fi
+  if valid_mysql_database_selection "--all-databases"; then return 1; fi
+  if valid_mysql_database_selection "app,app"; then return 1; fi
+  is_safe_display_name "业务备份"
+  if is_safe_display_name "   "; then return 1; fi
+  is_safe_local_absolute_path "/srv/My Site/data"
+  if is_safe_local_absolute_path "/srv/../etc"; then return 1; fi
+  BACKUP_TYPE="komari"
   TIMER_DAYS=0
   TIMER_HOURS=0
   TIMER_MINUTES=2
@@ -2803,16 +3881,20 @@ show_help() {
   cat <<HELP
 $PROGRAM_NAME v$VERSION
 
-支持发卡备份（Dujiao-Next）与探针备份（Komari Docker data）。
+支持 Dujiao-Next、Komari、自定义目录与 MySQL/MariaDB 数据库备份，
+可写入本地、阿里云 OSS、SFTP/SSH 或双远端。
 
 用法：
   bash dujiao-backup.sh install    交互式安装
-  dujiao-backup                    打开管理菜单
-  dujiao-backup backup             立即完整备份
-  dujiao-backup status             查看状态
+  dujiao-backup                    打开专业管理菜单
+  dujiao-backup backup             立即执行当前备份任务
+  dujiao-backup status             查看当前任务、目标、计划和最近结果
+  dujiao-backup history            查看执行记录和全部本地归档历史
   dujiao-backup configure          打开统一配置中心
-  dujiao-backup test               测试远端目标
-  dujiao-backup verify [文件]      校验备份包
+  dujiao-backup test               测试已启用的远端目标
+  dujiao-backup list-local         查看全部本地归档
+  dujiao-backup list-remote        查看 OSS/SFTP 远端归档
+  dujiao-backup verify [文件]      校验备份包（留空校验当前任务最新一份）
   dujiao-backup update             在线升级
   dujiao-backup version            显示版本
 
@@ -2827,6 +3909,7 @@ main() {
     menu) menu ;;
     backup) backup_command ;;
     status) status_command ;;
+    history) show_backup_history ;;
     configure) configure_command ;;
     timer-menu)
       require_root
