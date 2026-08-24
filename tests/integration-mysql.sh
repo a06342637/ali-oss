@@ -12,11 +12,13 @@ port="23306"
 password="integration-secret-42"
 config_tmp="/tmp/server-backup-mysql-config"
 extract_dir="/tmp/server-backup-mysql-extract"
+status_output="/tmp/server-backup-mysql-status"
+history_output="/tmp/server-backup-mysql-history"
 
 cleanup_test() {
   docker rm -f "$container" >/dev/null 2>&1 || true
   rm -rf -- "$extract_dir" /opt/dujiao-backup
-  rm -f -- "$config_tmp"
+  rm -f -- "$config_tmp" "$status_output" "$history_output"
 }
 trap cleanup_test EXIT
 cleanup_test
@@ -29,12 +31,12 @@ docker run -d --name "$container" \
   -e MARIADB_DATABASE=shop \
   mariadb:11 >/dev/null
 for _attempt in $(seq 1 120); do
-  if docker exec "$container" mariadb-admin ping -uroot -p"$password" --silent >/dev/null 2>&1; then
+  if docker exec "$container" mariadb -uroot -p"$password" -Nse 'SELECT 1' >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-docker exec "$container" mariadb-admin ping -uroot -p"$password" --silent >/dev/null
+test "$(docker exec "$container" mariadb -uroot -p"$password" -Nse 'SELECT 1')" = "1"
 
 docker exec "$container" mariadb -uroot -p"$password" shop -e \
   "CREATE TABLE orders(id INT PRIMARY KEY, note VARCHAR(100)); INSERT INTO orders VALUES (1, 'backup-row');"
@@ -101,7 +103,9 @@ if grep -Fq "$password" /opt/dujiao-backup/logs/dujiao-backup.log; then
   printf 'MySQL password leaked into the backup log.\n' >&2
   exit 1
 fi
-bash "$repo_dir/dujiao-backup.sh" status | grep -Fq '订单数据库'
-bash "$repo_dir/dujiao-backup.sh" history | grep -Fq 'MySQL（订单数据库）'
+bash "$repo_dir/dujiao-backup.sh" status > "$status_output"
+grep -Fq '订单数据库' "$status_output"
+bash "$repo_dir/dujiao-backup.sh" history > "$history_output"
+grep -Fq 'MySQL（订单数据库）' "$history_output"
 
 printf 'MySQL integration: OK\n'

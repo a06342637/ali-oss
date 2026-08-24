@@ -10,10 +10,12 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="/tmp/server-backup-directory source"
 restore_dir="/tmp/server-backup-directory-restore"
 config_tmp="/tmp/server-backup-directory-config"
+status_output="/tmp/server-backup-directory-status"
+history_output="/tmp/server-backup-directory-history"
 
 cleanup_test() {
   rm -rf -- "$source_dir" "$restore_dir"
-  rm -f -- "$config_tmp"
+  rm -f -- "$config_tmp" "$status_output" "$history_output"
   rm -rf -- /opt/dujiao-backup
 }
 trap cleanup_test EXIT
@@ -53,10 +55,12 @@ latest="$(find /opt/dujiao-backup/backups -maxdepth 1 -name 'directory-*.tar' -p
 bash "$repo_dir/dujiao-backup.sh" verify "$latest"
 
 test "$(awk -F '\t' '$5 == "success" {count++} END {print count+0}' /opt/dujiao-backup/state/backup-history.tsv)" -eq 2
-bash "$repo_dir/dujiao-backup.sh" status | grep -Fq '业务附件目录'
-bash "$repo_dir/dujiao-backup.sh" history | grep -Fq '最近备份执行记录'
-bash "$repo_dir/dujiao-backup.sh" history | grep -Fq '本地归档历史'
-bash "$repo_dir/dujiao-backup.sh" history | grep -Fq '自定义目录（业务附件目录）'
+bash "$repo_dir/dujiao-backup.sh" status > "$status_output"
+grep -Fq '业务附件目录' "$status_output"
+bash "$repo_dir/dujiao-backup.sh" history > "$history_output"
+grep -Fq '最近备份执行记录' "$history_output"
+grep -Fq '本地归档历史' "$history_output"
+grep -Fq '自定义目录（业务附件目录）' "$history_output"
 
 ln -s /etc/passwd "$source_dir/unsafe-link"
 if bash "$repo_dir/dujiao-backup.sh" backup; then
