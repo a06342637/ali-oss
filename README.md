@@ -8,7 +8,9 @@
 
 面向 Debian / Ubuntu 服务器的专业交互式备份管理器。一个脚本统一管理数据源、本地归档、远端同步、保留策略、定时任务、完整性校验和执行历史。当前仍是“一个活动任务配置”，可随时在四种类型之间切换。
 
-当前版本：`v1.3.0`
+当前版本：`v1.3.1`
+
+本次更新：独角数安装目录、数据库模式和容器自动识别，回车确认或手动修改；兼容官方二进制 SQLite 安装；修复 SFTP 校验失败误报成功、PostgreSQL 导出旧库、归档校验与升级写入失败的问题。
 
 ## 功能概览
 
@@ -17,6 +19,7 @@
 1. **发卡备份（Dujiao-Next）**
    - SQLite + Redis 官方 Compose 方案
    - PostgreSQL + Redis 官方 Compose 方案
+   - 官方一键安装和手工二进制/systemd 的 SQLite 方案
    - 数据库、上传文件与关键配置完整归档
 2. **探针备份（Komari）**
    - 自动识别 Docker 容器 `/app/data` 的宿主机挂载
@@ -74,7 +77,7 @@ bash /tmp/dujiao-backup.sh install
 6. 配置 systemd 定时任务
 7. 可选立即生成第一份备份
 
-为避免误用参考值，重要配置项必须明确输入。密码输入不会回显。
+备份类型、已识别的独角数安装目录、部署模式和 PostgreSQL 容器名支持直接回车确认；输入新值即可修改。无法识别的必填项仍需输入。远端凭据与危险操作仍要求明确确认，密码输入不会回显。
 
 ## 管理菜单
 
@@ -258,10 +261,17 @@ gzip -cd /root/restore-mysql/database.sql.gz \
 
 ## Dujiao-Next 发卡备份
 
-支持官方 Docker Compose：
+按[官方部署文档](https://dujiao-next.com/deploy/)支持：
 
 - 方案 A：SQLite + Redis
 - 方案 B：PostgreSQL + Redis
+- 官方一键安装、手工二进制/systemd：SQLite，`config.yml`、`db/` 和 `uploads/`
+
+安装向导从 Docker Compose 项目标签、容器挂载、systemd 工作目录及 `/opt`、`/srv`、网站目录等常见位置查找安装。默认目录不是固定猜测值：找到一个实例时显示实际目录，回车采用；多个实例时先列出供选择；找不到时要求手动填写。手动改目录后，会重新识别该目录的配置和容器。
+
+数据库类型以 `database.driver` 为准，兼容引号和行尾注释。PostgreSQL 容器根据当前项目或数据挂载关联，不会因另一站点存在 `dujiaonext-postgres` 就判断当前站点使用 PostgreSQL。容器改名、SQLite 数据库文件改名、上传目录使用其他宿主机挂载均可识别；保存后会保留路径，并在备份时复核容器挂载。
+
+支持官方 `docker-compose.sqlite.yml` / `docker-compose.postgres.yml`、常规 `compose.yml` / `compose.yaml` / `docker-compose.yml` / `docker-compose.yaml`，以及 Compose 标签标明的单个自定义文件。二进制安装不要求 Docker、`.env` 或 Compose 文件。Docker 数据必须挂载到宿主机；使用多份 Compose 文件叠加的部署需先合并配置。PostgreSQL 备份目前仍需可运行的 Docker 数据库容器。
 
 每份 `dujiao-next-YYYYMMDD-HHMMSS.tar` 包含：
 
@@ -274,6 +284,12 @@ SHA256SUMS
 ```
 
 SQLite 使用 Online Backup；PostgreSQL 使用 custom-format `pg_dump` 并通过 `pg_restore --list` 校验。Redis 仅作为缓存和队列，不包含在业务备份中。
+
+PostgreSQL 导出读取应用当前 `database.dsn` 的数据库名称，支持 libpq 连接串和 PostgreSQL URI；不会因为容器初始化时的 `POSTGRES_DB` 未更新而导出旧库。无法可靠解析库名时会拒绝导出。旧配置没有 DSN 时，仍兼容容器的默认库名。
+
+`config.tar.gz` 始终包含实际使用的 `config.yml`（官方 Compose 保留 `config/config.yml` 路径）；`.env` 和 Compose 文件存在时一同归档。`uploads.tar.gz` 内统一为 `uploads/`，恢复到实际上传目录即可。配置中的 `app.secret_key` 会随对应数据库一起备份，详见[官方备份与恢复文档](https://dujiao-next.com/deploy/backup)。
+
+每轮备份都会在上传和保留策略之前完整校验新归档；无效的新归档会删除并记录失败，已有备份会保留。历史归档在首次上传或补传之前也会校验。SFTP 校验失败会停止原子改名，保留原有远端文件；连接失败会明确返回失败。安装和在线升级先写入同目录临时脚本并检查语法，再原子替换入口，写入失败时保留原程序。
 
 ## Komari 探针备份
 
@@ -459,7 +475,7 @@ dujiao-backup version
 dujiao-backup update
 ```
 
-`v1.3.0` 保持 `CONFIG_VERSION=1`，旧配置可直接加载：
+`v1.3.1` 保持 `CONFIG_VERSION=1`，旧配置可直接加载：
 
 - 旧配置没有新增字段时自动使用安全默认值
 - 原 `dujiao` / `komari` 任务不受影响
@@ -472,7 +488,7 @@ dujiao-backup update
 - root
 - Bash 4.4+
 - `apt-get`
-- Dujiao / Komari 类型需要 Docker
+- Komari 和 Dujiao 的 Docker / PostgreSQL 模式需要 Docker；Dujiao 二进制 SQLite 模式无需 Docker
 - MySQL 宿主机模式需要 `mysql`/`mariadb` 和 `mysqldump`/`mariadb-dump`；向导可自动安装
 - OSS 模式支持 amd64 / arm64 的 `ossutil`
 

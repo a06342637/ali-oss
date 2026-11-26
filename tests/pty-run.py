@@ -16,6 +16,7 @@ import time
 
 
 PROMPT_MARKERS = (
+    "直接回车使用]: ".encode(),
     "必须输入）: ".encode(),
     "必须重新输入）: ".encode(),
     "必须输入]: ".encode(),

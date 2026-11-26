@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly PROGRAM_NAME="Server Backup Manager"
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly REPOSITORY_URL="https://github.com/a06342637/ali-oss"
 readonly RAW_SCRIPT_URL="https://raw.githubusercontent.com/a06342637/ali-oss/main/dujiao-backup.sh"
 readonly INSTALL_DIR="/opt/dujiao-backup"
@@ -31,6 +31,7 @@ LOG_CAPTURE_PID=""
 ERROR_HANDLED=0
 ACTIVE_PARTIAL=""
 CREATED_ARCHIVE=""
+PENDING_ARCHIVE=""
 ACTIVE_BACKUP_RUN=0
 ACTIVE_RUN_ID=""
 ACTIVE_RUN_STARTED=""
@@ -43,6 +44,9 @@ DEPLOY_MODE=""
 COMPOSE_FILE=""
 DB_FILE=""
 PG_CONTAINER="dujiaonext-postgres"
+DUJIAO_CONTAINER=""
+DUJIAO_CONFIG_FILE=""
+DUJIAO_UPLOAD_DIR=""
 KOMARI_CONTAINER="komari"
 KOMARI_DATA_DIR="/komari/data"
 KOMARI_DB_FILE="/komari/data/komari.db"
@@ -155,6 +159,11 @@ cleanup() {
   fi
   if [[ -n "$ACTIVE_PARTIAL" && "$ACTIVE_PARTIAL" == "$BACKUP_DIR"/.*.partial ]]; then
     rm -f -- "$ACTIVE_PARTIAL"
+  fi
+  if [[ -n "$PENDING_ARCHIVE" && "$PENDING_ARCHIVE" == "$BACKUP_DIR/"* ]] \
+    && valid_supported_archive_name "${PENDING_ARCHIVE##*/}" \
+    && [[ "$PENDING_ARCHIVE" == "$BACKUP_DIR/${PENDING_ARCHIVE##*/}" ]]; then
+    rm -f -- "$PENDING_ARCHIVE"
   fi
   for path in "${TEMP_PATHS[@]:-}"; do
     case "$path" in
@@ -407,12 +416,20 @@ prompt_choice() {
   local prompt_choice_minimum="$3"
   local prompt_choice_maximum="$4"
   local prompt_choice_default="$5"
+  local prompt_choice_use_default="${6:-0}"
   local prompt_choice_input
   require_tty
   while true; do
-    printf '%s（参考值：%s，必须输入）: ' "$prompt_choice_message" "$prompt_choice_default"
+    if [[ "$prompt_choice_use_default" -eq 1 ]]; then
+      printf '%s [%s，直接回车使用]: ' "$prompt_choice_message" "$prompt_choice_default"
+    else
+      printf '%s（参考值：%s，必须输入）: ' "$prompt_choice_message" "$prompt_choice_default"
+    fi
     IFS= read -r prompt_choice_input < /dev/tty
     prompt_choice_input="$(trim_outer_whitespace "$prompt_choice_input")"
+    if [[ -z "$prompt_choice_input" && "$prompt_choice_use_default" -eq 1 ]]; then
+      prompt_choice_input="$prompt_choice_default"
+    fi
     if validate_uint_between "$prompt_choice_input" "$prompt_choice_minimum" "$prompt_choice_maximum"; then
       printf -v "$prompt_choice_variable_name" '%s' "$prompt_choice_input"
       return 0
@@ -450,6 +467,9 @@ set_config_defaults() {
   COMPOSE_FILE=""
   DB_FILE=""
   PG_CONTAINER="dujiaonext-postgres"
+  DUJIAO_CONTAINER=""
+  DUJIAO_CONFIG_FILE=""
+  DUJIAO_UPLOAD_DIR=""
   KOMARI_CONTAINER="komari"
   KOMARI_DATA_DIR="/komari/data"
   KOMARI_DB_FILE="/komari/data/komari.db"
@@ -537,6 +557,9 @@ save_config() {
     write_config_value COMPOSE_FILE
     write_config_value DB_FILE
     write_config_value PG_CONTAINER
+    write_config_value DUJIAO_CONTAINER
+    write_config_value DUJIAO_CONFIG_FILE
+    write_config_value DUJIAO_UPLOAD_DIR
     write_config_value KOMARI_CONTAINER
     write_config_value KOMARI_DATA_DIR
     write_config_value CUSTOM_DIR_NAME
@@ -615,6 +638,7 @@ valid_mysql_database_selection() {
   local value="$1" item seen=","
   local -a items
   [[ -n "$value" ]] || return 1
+  [[ "$value" != ,* && "$value" != *, && "$value" != *,,* ]] || return 1
   IFS=',' read -r -a items <<< "$value"
   [[ "${#items[@]}" -gt 0 ]] || return 1
   for item in "${items[@]}"; do
@@ -727,17 +751,317 @@ validate_sftp_settings() {
 }
 
 set_deployment_paths() {
+  local detected dsn compose_status
+  [[ -n "$DUJIAO_CONFIG_FILE" ]] || DUJIAO_CONFIG_FILE="$(dujiao_config_file "$APP_DIR" || true)"
+  [[ -n "$DUJIAO_CONFIG_FILE" ]] || DUJIAO_CONFIG_FILE="$APP_DIR/config/config.yml"
+  if [[ -z "$DUJIAO_UPLOAD_DIR" ]]; then
+    if [[ -d "$APP_DIR/data/uploads" ]]; then
+      DUJIAO_UPLOAD_DIR="$APP_DIR/data/uploads"
+    else
+      DUJIAO_UPLOAD_DIR="$APP_DIR/uploads"
+    fi
+  fi
+  if [[ -z "$COMPOSE_FILE" ]]; then
+    if detected="$(detect_dujiao_compose_file "$APP_DIR" "$DEPLOY_MODE")"; then
+      COMPOSE_FILE="$detected"
+    else
+      compose_status="$?"
+      [[ "$compose_status" -ne 2 ]] || die "Compose 使用多个文件，无法完整备份该编排；请先合并配置。"
+      if [[ ! -f "$DUJIAO_CONFIG_FILE" && "$DUJIAO_CONFIG_FILE" == "$APP_DIR/config/config.yml" ]]; then
+        COMPOSE_FILE="$APP_DIR/docker-compose.$DEPLOY_MODE.yml"
+      fi
+    fi
+  fi
   case "$DEPLOY_MODE" in
     sqlite)
-      COMPOSE_FILE="$APP_DIR/docker-compose.sqlite.yml"
-      DB_FILE="$APP_DIR/data/db/dujiao.db"
+      if [[ -z "$DB_FILE" ]]; then
+        dsn="$(dujiao_database_value "$DUJIAO_CONFIG_FILE" dsn)"
+        dsn="${dsn%%\?*}"
+        if [[ "$dsn" == /app/db/* ]]; then
+          DB_FILE="$APP_DIR/data/db/${dsn#/app/db/}"
+        elif [[ "$dsn" == /* ]]; then
+          DB_FILE="${dsn%%\?*}"
+        elif [[ -n "$dsn" ]]; then
+          DB_FILE="$APP_DIR/${dsn#./}"
+          DB_FILE="${DB_FILE%%\?*}"
+        elif [[ "$DUJIAO_CONFIG_FILE" == "$APP_DIR/config/config.yml" ]]; then
+          DB_FILE="$APP_DIR/data/db/dujiao.db"
+        else
+          DB_FILE="$APP_DIR/db/dujiao.db"
+        fi
+      fi
       ;;
     postgres)
-      COMPOSE_FILE="$APP_DIR/docker-compose.postgres.yml"
       DB_FILE=""
       ;;
     *) die "部署模式必须是 sqlite 或 postgres。" ;;
   esac
+}
+
+# Read only literal scalars in the database block; never execute config/.env.
+dujiao_database_value() {
+  local file="$1" key="$2" value
+  [[ -f "$file" ]] || return 0
+  value="$(awk -v key="$key" '
+    /^database:[[:space:]]*(#.*)?$/ { block=1; next }
+    block && /^[^[:space:]#]/ { exit }
+    block && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {
+      sub("^[[:space:]]+" key ":[[:space:]]*", "")
+      sub(/[[:space:]]+#.*$/, ""); print; exit
+    }
+  ' "$file")"
+  value="$(trim_outer_whitespace "$value")"
+  if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+# Parse libpq key/value strings without evaluating passwords or quoted values.
+dujiao_libpq_value() {
+  local dsn="$1" wanted="$2" key value char quoted result="" i=0 length="${#1}"
+  while [[ "$i" -lt "$length" ]]; do
+    while [[ "$i" -lt "$length" && "${dsn:i:1}" == [[:space:]] ]]; do i=$((i + 1)); done
+    [[ "$i" -lt "$length" ]] || break
+    key=""
+    while [[ "$i" -lt "$length" && "${dsn:i:1}" != '=' && "${dsn:i:1}" != [[:space:]] ]]; do
+      key+="${dsn:i:1}"; i=$((i + 1))
+    done
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    while [[ "$i" -lt "$length" && "${dsn:i:1}" == [[:space:]] ]]; do i=$((i + 1)); done
+    [[ "${dsn:i:1}" == '=' ]] || return 1
+    i=$((i + 1))
+    while [[ "$i" -lt "$length" && "${dsn:i:1}" == [[:space:]] ]]; do i=$((i + 1)); done
+    value=""; quoted=0
+    if [[ "${dsn:i:1}" == "'" ]]; then quoted=1; i=$((i + 1)); fi
+    while [[ "$i" -lt "$length" ]]; do
+      char="${dsn:i:1}"; i=$((i + 1))
+      if [[ "$char" == '\' ]]; then
+        [[ "$i" -lt "$length" ]] || return 1
+        value+="${dsn:i:1}"; i=$((i + 1))
+      elif [[ "$quoted" -eq 1 && "$char" == "'" ]]; then
+        quoted=0
+        [[ "$i" -eq "$length" || "${dsn:i:1}" == [[:space:]] ]] || return 1
+        break
+      elif [[ "$quoted" -eq 0 && "$char" == [[:space:]] ]]; then
+        break
+      else
+        value+="$char"
+      fi
+    done
+    [[ "$quoted" -eq 0 ]] || return 1
+    [[ "$key" != "$wanted" ]] || result="$value"
+  done
+  printf '%s' "$result"
+}
+
+dujiao_postgres_database_name() {
+  local dsn name authority hex char query pair decoded=""
+  dsn="$(dujiao_database_value "$DUJIAO_CONFIG_FILE" dsn)"
+  [[ -n "$dsn" ]] || return 0
+  case "$dsn" in
+    postgres://*|postgresql://*)
+      dsn="${dsn#*://}"
+      authority="${dsn%%/*}"
+      authority="${authority%%\?*}"
+      if [[ "$dsn" == */* ]]; then name="${dsn#*/}"; name="${name%%\?*}"; else name=""; fi
+      if [[ -z "$name" && "$authority" == *@* ]]; then
+        name="${authority%%@*}"; name="${name%%:*}"
+      fi
+      if [[ "$dsn" == *\?* ]]; then
+        query="${dsn#*\?}"
+        while [[ -n "$query" ]]; do
+          pair="${query%%&*}"
+          [[ "$pair" != dbname=* ]] || name="${pair#dbname=}"
+          [[ "$query" == *'&'* ]] || break
+          query="${query#*&}"
+        done
+      fi
+      while [[ -n "$name" ]]; do
+        if [[ "$name" == %* ]]; then
+          hex="${name:1:2}"
+          [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ && "$hex" != 00 ]] || return 1
+          printf -v char '%b' "\\x$hex"
+          decoded+="$char"; name="${name:3}"
+        else
+          decoded+="${name:0:1}"; name="${name:1}"
+        fi
+      done
+      name="$decoded"
+      ;;
+    *)
+      name="$(dujiao_libpq_value "$dsn" dbname)" || return 1
+      if [[ -z "$name" ]]; then name="$(dujiao_libpq_value "$dsn" user)" || return 1; fi
+      ;;
+  esac
+  [[ -n "$name" && "$name" != *[[:cntrl:]]* && "$name" != *'='* && "$name" != *'://'* ]] || return 1
+  printf '%s' "$name"
+}
+
+dujiao_config_file() {
+  local dir="$1"
+  if [[ -f "$dir/config/config.yml" ]]; then
+    printf '%s' "$dir/config/config.yml"
+  elif [[ -f "$dir/config.yml" ]]; then
+    printf '%s' "$dir/config.yml"
+  else
+    return 1
+  fi
+}
+
+is_dujiao_directory() {
+  local dir="$1" config
+  is_safe_absolute_path "$dir" || return 1
+  config="$(dujiao_config_file "$dir")" || return 1
+  [[ -n "$(dujiao_database_value "$config" driver)" ]] || return 1
+  [[ -d "$dir/data/uploads" || -d "$dir/uploads" || -f "$dir/dujiao-next" ]]
+}
+
+dujiao_container_ids() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps -aq 2>/dev/null || true
+}
+
+dujiao_container_is_app() {
+  local image
+  image="$(docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null)" || return 1
+  case "$image" in
+    dujiaonext/dujiao-next:*|*/dujiaonext/dujiao-next:*|dujiaonext/dujiao-next@*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+dujiao_container_workdir() {
+  docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$1" 2>/dev/null || true
+}
+
+dujiao_mount_source() {
+  local container="$1" target="$2"
+  docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$target\"}}{{println .Source}}{{end}}{{end}}" "$container" 2>/dev/null || true
+}
+
+dujiao_container_path_source() {
+  local container="$1" target="$2" source destination best="" best_length=0
+  while IFS=$'\t' read -r source destination; do
+    [[ -n "$destination" ]] || continue
+    if [[ "$target" == "$destination" || "$target" == "$destination/"* ]] \
+      && [[ "${#destination}" -gt "$best_length" ]]; then
+      best="$source${target#"$destination"}"
+      best_length="${#destination}"
+    fi
+  done < <(docker inspect -f '{{range .Mounts}}{{printf "%s\t%s\n" .Source .Destination}}{{end}}' "$container" 2>/dev/null || true)
+  [[ -n "$best" ]] || return 1
+  printf '%s' "$best"
+}
+
+dujiao_container_database_source() {
+  local container="$1" config="$2" dsn workdir
+  dsn="$(dujiao_database_value "$config" dsn)"
+  dsn="${dsn:-./db/dujiao.db}"
+  dsn="${dsn%%\?*}"
+  if [[ "$dsn" != /* ]]; then
+    workdir="$(docker inspect -f '{{.Config.WorkingDir}}' "$container" 2>/dev/null || true)"
+    workdir="${workdir:-/app}"
+    dsn="$workdir/${dsn#./}"
+  fi
+  dujiao_container_path_source "$container" "$dsn"
+}
+
+dujiao_directory_candidates() {
+  local id dir source root config
+  {
+    if is_dujiao_directory "$APP_DIR"; then printf '%s\n' "$APP_DIR"; fi
+    for dir in /opt/dujiao-next /opt/dujiao; do
+      if is_dujiao_directory "$dir"; then printf '%s\n' "$dir"; fi
+    done
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      dujiao_container_is_app "$id" || continue
+      dir="$(dujiao_container_workdir "$id")"
+      if is_dujiao_directory "$dir"; then printf '%s\n' "$dir"; fi
+      source="$(dujiao_mount_source "$id" /app/config.yml)"
+      case "$source" in
+        */config/config.yml) dir="${source%/config/config.yml}" ;;
+        */config.yml) dir="${source%/config.yml}" ;;
+        *) continue ;;
+      esac
+      if is_dujiao_directory "$dir"; then printf '%s\n' "$dir"; fi
+    done < <(dujiao_container_ids)
+    if command -v systemctl >/dev/null 2>&1; then
+      for id in dujiao-next.service dujiao.service; do
+        dir="$(systemctl show "$id" -p WorkingDirectory --value 2>/dev/null || true)"
+        if is_dujiao_directory "$dir"; then printf '%s\n' "$dir"; fi
+      done
+    fi
+    # Bounded scan also covers renamed and panel-managed installations.
+    for root in /opt /srv /var/www /www/wwwroot /home /root; do
+      [[ -d "$root" ]] || continue
+      while IFS= read -r config; do
+        case "$config" in
+          */config/config.yml) dir="${config%/config/config.yml}" ;;
+          *) dir="${config%/config.yml}" ;;
+        esac
+        if is_dujiao_directory "$dir"; then printf '%s\n' "$dir"; fi
+      done < <(find "$root" -maxdepth 5 \
+        \( -name backups -o -name node_modules -o -name .git -o -path "$INSTALL_DIR" \) -prune -o \
+        -type f -name config.yml -print 2>/dev/null || true)
+    done
+  } | sort -u
+}
+
+detect_dujiao_app_container() {
+  local dir="$1" id workdir source
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    workdir="$(dujiao_container_workdir "$id")"
+    source="$(dujiao_mount_source "$id" /app/config.yml)"
+    if [[ "$source" == "$dir/config/config.yml" || "$source" == "$dir/config.yml" ]] \
+      || { [[ "$workdir" == "$dir" ]] && dujiao_container_is_app "$id"; }; then
+      docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's,^/,,'
+    fi
+  done < <(dujiao_container_ids)
+}
+
+detect_dujiao_postgres_container() {
+  local dir="$1" app="$2" project="" id image candidate_project workdir mount
+  if [[ -n "$app" ]]; then
+    project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$app" 2>/dev/null || true)"
+    [[ "$project" != '<no value>' ]] || project=""
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    image="$(docker inspect -f '{{.Config.Image}}' "$id" 2>/dev/null || true)"
+    case "$image" in postgres:*|*/postgres:*|postgres@*) ;; *) continue ;; esac
+    candidate_project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true)"
+    workdir="$(dujiao_container_workdir "$id")"
+    mount="$(dujiao_mount_source "$id" /var/lib/postgresql/data)"
+    if [[ "$workdir" == "$dir" || "$mount" == "$dir/data/postgres" ]] \
+      || [[ -n "$project" && "$candidate_project" == "$project" ]]; then
+      docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's,^/,,'
+    fi
+  done < <(dujiao_container_ids)
+}
+
+detect_dujiao_compose_file() {
+  local dir="$1" mode="$2" file labeled
+  local -a files=()
+  if [[ -n "$DUJIAO_CONTAINER" ]]; then
+    labeled="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$DUJIAO_CONTAINER" 2>/dev/null || true)"
+    if [[ "$labeled" == "$dir/"* && "$labeled" != *,* && -f "$labeled" ]]; then
+      printf '%s' "$labeled"
+      return 0
+    fi
+    [[ "$labeled" != *,* ]] || return 2
+  fi
+  for file in "$dir/docker-compose.$mode.yml" "$dir/docker-compose.$mode.yaml"; do
+    if [[ -f "$file" ]]; then printf '%s' "$file"; return 0; fi
+  done
+  for file in "$dir/compose.yml" "$dir/compose.yaml" "$dir/docker-compose.yml" "$dir/docker-compose.yaml"; do
+    if [[ -f "$file" ]]; then files+=("$file"); fi
+  done
+  [[ "${#files[@]}" -le 1 ]] || return 2
+  [[ "${#files[@]}" -eq 1 ]] || return 1
+  printf '%s' "${files[0]}"
 }
 
 set_komari_paths() {
@@ -790,26 +1114,19 @@ current_archive_pattern() {
 
 detect_deployment_mode() {
   local app_dir="$1"
-  local config_yml="$app_dir/config/config.yml"
+  local config_yml driver
   local has_sqlite=0
   local has_postgres=0
   [[ -f "$app_dir/docker-compose.sqlite.yml" ]] && has_sqlite=1
   [[ -f "$app_dir/docker-compose.postgres.yml" ]] && has_postgres=1
 
-  if [[ -f "$config_yml" ]]; then
-    if grep -Eq '^[[:space:]]*driver:[[:space:]]*postgres([[:space:]]|$)' "$config_yml"; then
-      printf 'postgres'
-      return 0
-    fi
-    if grep -Eq '^[[:space:]]*driver:[[:space:]]*sqlite([[:space:]]|$)' "$config_yml"; then
-      printf 'sqlite'
-      return 0
-    fi
-  fi
-  if command -v docker >/dev/null 2>&1 && docker inspect dujiaonext-postgres >/dev/null 2>&1; then
-    printf 'postgres'
-    return 0
-  fi
+  config_yml="$(dujiao_config_file "$app_dir" || true)"
+  driver="$(dujiao_database_value "$config_yml" driver)"
+  case "$driver" in
+    sqlite|postgres) printf '%s' "$driver"; return 0 ;;
+    '') ;;
+    *) return 1 ;;
+  esac
   if [[ "$has_postgres" -eq 1 && "$has_sqlite" -eq 0 ]]; then
     printf 'postgres'
     return 0
@@ -818,7 +1135,7 @@ detect_deployment_mode() {
     printf 'sqlite'
     return 0
   fi
-  if [[ -f "$app_dir/data/db/dujiao.db" && "$has_sqlite" -eq 1 ]]; then
+  if [[ "$has_postgres" -eq 0 ]] && [[ -f "$app_dir/data/db/dujiao.db" || -f "$app_dir/db/dujiao.db" ]]; then
     printf 'sqlite'
     return 0
   fi
@@ -826,19 +1143,44 @@ detect_deployment_mode() {
 }
 
 validate_deployment() {
+  local actual_source driver
   is_safe_absolute_path "$APP_DIR" || die "Dujiao-Next 目录必须是安全的绝对路径，不能含空格或 ..。"
   [[ -d "$APP_DIR" ]] || die "没有找到 Dujiao-Next 目录：$APP_DIR"
-  [[ -f "$APP_DIR/.env" ]] || die "没有找到 $APP_DIR/.env"
-  [[ -f "$APP_DIR/config/config.yml" ]] || die "没有找到 $APP_DIR/config/config.yml"
-  [[ -d "$APP_DIR/data/uploads" ]] || die "没有找到 $APP_DIR/data/uploads"
-  [[ -f "$COMPOSE_FILE" ]] || die "没有找到 Compose 文件：$COMPOSE_FILE"
-  command -v docker >/dev/null 2>&1 || die "没有找到 Docker；请先完成 Dujiao-Next Docker Compose 部署。"
+  is_safe_absolute_path "$DUJIAO_CONFIG_FILE" || die "应用配置文件路径无效。"
+  is_safe_absolute_path "$DUJIAO_UPLOAD_DIR" || die "上传目录路径无效。"
+  [[ -f "$DUJIAO_CONFIG_FILE" ]] || die "没有找到配置文件：$DUJIAO_CONFIG_FILE"
+  driver="$(dujiao_database_value "$DUJIAO_CONFIG_FILE" driver)"
+  if [[ "$driver" == sqlite || "$driver" == postgres ]]; then
+    [[ "$driver" == "$DEPLOY_MODE" ]] || die "保存的数据库模式与应用 config.yml 不一致，请重新识别部署。"
+  fi
+  [[ -d "$DUJIAO_UPLOAD_DIR" ]] || die "没有找到上传目录：$DUJIAO_UPLOAD_DIR"
+  if [[ -n "$DUJIAO_CONTAINER" ]]; then
+    [[ "$DUJIAO_CONTAINER" =~ ^[A-Za-z0-9_.-]+$ ]] || die "应用容器名无效。"
+    actual_source="$(dujiao_mount_source "$DUJIAO_CONTAINER" /app/config.yml)"
+    [[ "$actual_source" == "$DUJIAO_CONFIG_FILE" ]] || die "应用配置挂载已变化，请重新识别部署。"
+    actual_source="$(dujiao_mount_source "$DUJIAO_CONTAINER" /app/uploads)"
+    [[ "$actual_source" == "$DUJIAO_UPLOAD_DIR" ]] || die "上传目录挂载已变化，请重新识别部署。"
+    if [[ "$DEPLOY_MODE" == "sqlite" ]]; then
+      actual_source="$(dujiao_container_database_source "$DUJIAO_CONTAINER" "$DUJIAO_CONFIG_FILE")" \
+        || die "SQLite 数据库没有可读取的宿主机挂载。"
+      [[ "$actual_source" == "$DB_FILE" ]] || die "SQLite 数据库挂载或配置已变化，请重新识别部署。"
+    fi
+  fi
+  if [[ -n "$COMPOSE_FILE" ]]; then
+    is_safe_absolute_path "$COMPOSE_FILE" || die "Compose 文件路径无效。"
+    [[ "$COMPOSE_FILE" == "$APP_DIR/"* && -f "$COMPOSE_FILE" ]] || die "没有找到应用目录内的 Compose 文件：$COMPOSE_FILE"
+    [[ "${COMPOSE_FILE##*/}" =~ ^[A-Za-z0-9_.-]+\.(yml|yaml)$ && "${COMPOSE_FILE##*/}" != config.yml ]] \
+      || die "Compose 文件必须使用独立的 .yml/.yaml 文件名。"
+  fi
   case "$DEPLOY_MODE" in
     sqlite)
       command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 尚未安装。"
+      is_safe_absolute_path "$DB_FILE" || die "SQLite 数据库路径无效。"
       [[ -f "$DB_FILE" ]] || die "没有找到 SQLite 数据库：$DB_FILE"
       ;;
     postgres)
+      dujiao_postgres_database_name >/dev/null || die "无法解析应用的 PostgreSQL 数据库名称，已拒绝导出其他数据库。"
+      command -v docker >/dev/null 2>&1 || die "PostgreSQL 备份需要 Docker 数据库容器；当前未安装 Docker。"
       docker inspect "$PG_CONTAINER" >/dev/null 2>&1 || die "没有找到 PostgreSQL 容器：$PG_CONTAINER"
       [[ "$(docker inspect -f '{{.State.Running}}' "$PG_CONTAINER")" == "true" ]] || die "PostgreSQL 容器没有运行：$PG_CONTAINER"
       ;;
@@ -847,12 +1189,46 @@ validate_deployment() {
 }
 
 choose_deployment_interactive() {
-  local input_dir detected choice container_name
+  local input_dir detected choice container_name dir default_dir="" app source
+  local -a candidates containers
   heading "识别 Dujiao-Next 部署方式"
-  prompt_text input_dir "Dujiao-Next 安装目录" "$APP_DIR" 1
+  mapfile -t candidates < <(dujiao_directory_candidates)
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    default_dir="${candidates[0]}"
+    info "已自动识别安装目录：$default_dir"
+  elif [[ "${#candidates[@]}" -gt 1 ]]; then
+    warn "发现多个 Dujiao-Next 安装，请选择要备份的实例。"
+    for dir in "${!candidates[@]}"; do
+      printf '  %s) %s\n' "$((dir + 1))" "${candidates[dir]}"
+    done
+    prompt_choice choice "请选择安装实例" 1 "${#candidates[@]}" 1
+    default_dir="${candidates[choice - 1]}"
+  else
+    warn "没有找到可确认的安装目录，请输入实际路径。"
+  fi
+  if [[ -n "$default_dir" ]]; then
+    prompt_text input_dir "Dujiao-Next 安装目录（可输入其他路径）" "$default_dir" 0
+  else
+    prompt_text input_dir "Dujiao-Next 安装目录" "" 1
+  fi
   input_dir="$(normalize_absolute_path "$input_dir")"
   is_safe_absolute_path "$input_dir" || die "安装目录只能使用不含空格和 .. 的绝对路径。"
   APP_DIR="$input_dir"
+  DEPLOY_MODE=""
+  COMPOSE_FILE=""
+  DB_FILE=""
+  DUJIAO_CONTAINER=""
+  DUJIAO_CONFIG_FILE="$(dujiao_config_file "$APP_DIR" || true)"
+  DUJIAO_UPLOAD_DIR=""
+  mapfile -t containers < <(detect_dujiao_app_container "$APP_DIR" | sort -u)
+  if [[ "${#containers[@]}" -eq 1 ]]; then
+    DUJIAO_CONTAINER="${containers[0]}"
+  elif [[ "${#containers[@]}" -gt 1 ]]; then
+    warn "目录关联多个应用容器，请选择实际运行的实例。"
+    for dir in "${!containers[@]}"; do printf '  %s) %s\n' "$((dir + 1))" "${containers[dir]}"; done
+    prompt_choice choice "请选择应用容器" 1 "${#containers[@]}" 1
+    DUJIAO_CONTAINER="${containers[choice - 1]}"
+  fi
   if detected="$(detect_deployment_mode "$APP_DIR")"; then
     DEPLOY_MODE="$detected"
     if [[ "$DEPLOY_MODE" == "postgres" ]]; then
@@ -862,17 +1238,48 @@ choose_deployment_interactive() {
     fi
   else
     warn "无法可靠自动识别，请手动选择。"
-    printf '  1) 方案 A：SQLite + Redis\n'
-    printf '  2) 方案 B：PostgreSQL + Redis\n'
-    prompt_choice choice "请选择部署模式" 1 2 2
-    [[ "$choice" -eq 1 ]] && DEPLOY_MODE="sqlite" || DEPLOY_MODE="postgres"
+  fi
+  printf '  1) SQLite\n  2) PostgreSQL\n'
+  choice=2
+  [[ "$DEPLOY_MODE" != "sqlite" ]] || choice=1
+  if [[ -n "$DEPLOY_MODE" ]]; then
+    prompt_choice choice "确认部署模式（可修改）" 1 2 "$choice" 1
+  else
+    prompt_choice choice "请选择部署模式" 1 2 "$choice"
+  fi
+  [[ "$choice" -eq 1 ]] && DEPLOY_MODE="sqlite" || DEPLOY_MODE="postgres"
+  if [[ -n "$DUJIAO_CONTAINER" ]]; then
+    app="$DUJIAO_CONTAINER"
+    source="$(dujiao_mount_source "$app" /app/config.yml)"
+    [[ -n "$source" ]] || die "应用配置没有挂载到宿主机，无法创建完整备份。"
+    DUJIAO_CONFIG_FILE="$source"
+    DUJIAO_UPLOAD_DIR="$(dujiao_mount_source "$app" /app/uploads)"
+    [[ -n "$DUJIAO_UPLOAD_DIR" ]] || die "上传目录没有挂载到宿主机，无法创建完整备份。"
+    if [[ "$DEPLOY_MODE" == "sqlite" ]]; then
+      DB_FILE="$(dujiao_container_database_source "$app" "$DUJIAO_CONFIG_FILE")" \
+        || die "SQLite 数据库没有可读取的宿主机挂载。"
+    fi
   fi
   set_deployment_paths
   if [[ "$DEPLOY_MODE" == "postgres" ]]; then
-    prompt_text container_name "PostgreSQL 容器名" "$PG_CONTAINER" 1
+    mapfile -t containers < <(detect_dujiao_postgres_container "$APP_DIR" "$DUJIAO_CONTAINER" | sort -u)
+    if [[ "${#containers[@]}" -eq 1 ]]; then
+      info "已自动识别 PostgreSQL 容器：${containers[0]}"
+      prompt_text container_name "PostgreSQL 容器名（可修改）" "${containers[0]}" 0
+    elif [[ "${#containers[@]}" -gt 1 ]]; then
+      warn "发现多个关联 PostgreSQL 容器，请选择。"
+      for dir in "${!containers[@]}"; do printf '  %s) %s\n' "$((dir + 1))" "${containers[dir]}"; done
+      prompt_choice choice "请选择数据库容器" 1 "${#containers[@]}" 1
+      prompt_text container_name "PostgreSQL 容器名（可修改）" "${containers[choice - 1]}" 0
+    else
+      warn "没有找到关联的 PostgreSQL 容器，请输入实际容器名。"
+      prompt_text container_name "PostgreSQL 容器名" "" 1
+    fi
     [[ "$container_name" =~ ^[A-Za-z0-9_.-]+$ ]] || die "PostgreSQL 容器名格式不正确。"
     PG_CONTAINER="$container_name"
   fi
+  printf '应用配置：%s\n上传目录：%s\n' "$DUJIAO_CONFIG_FILE" "$DUJIAO_UPLOAD_DIR"
+  [[ "$DEPLOY_MODE" != "sqlite" ]] || printf 'SQLite 数据库：%s\n' "$DB_FILE"
   CURRENT_STEP="检查 Dujiao-Next 部署"
   validate_deployment
   success "Dujiao-Next 部署检查通过。"
@@ -1401,7 +1808,7 @@ choose_backup_type_interactive() {
   printf '  2) 探针备份：Komari（Docker /app/data 完整数据）\n'
   printf '  3) 自定义目录：备份任意指定目录的全部普通文件\n'
   printf '  4) MySQL 数据库：自动扫描本机/容器并执行一致性逻辑备份\n'
-  prompt_choice choice "请选择" 1 4 "$default_choice"
+  prompt_choice choice "请选择" 1 4 "$default_choice" 1
   case "$choice" in
     1) BACKUP_TYPE="dujiao"; choose_deployment_interactive ;;
     2) BACKUP_TYPE="komari"; choose_komari_interactive ;;
@@ -1952,7 +2359,7 @@ sftp_upload_file() {
     -o UserKnownHostsFile="$SFTP_KNOWN_HOSTS" \
     -o ConnectTimeout=15 \
     "$SFTP_USER@$SFTP_HOST"
-  sftp_ssh "actual=\$(sha256sum '$remote_partial'); actual=\${actual%% *}; test \"\$actual\" = '$expected'; mv -f -- '$remote_partial' '$remote_final'"
+  sftp_ssh "set -eu; actual=\$(sha256sum '$remote_partial'); actual=\${actual%% *}; test \"\$actual\" = '$expected'; mv -f -- '$remote_partial' '$remote_final'"
 }
 
 test_sftp_connection() {
@@ -2014,7 +2421,7 @@ write_marker() {
 
 create_dujiao_archive() {
   local stamp archive_name archive_path work database_name
-  local app_image upload_files database_size partial
+  local app_image upload_files database_size partial config_stage config_member postgres_database
   local -a config_items
   CURRENT_STEP="创建本地一致性备份"
   stamp="$(date +%Y%m%d-%H%M%S)"
@@ -2034,9 +2441,11 @@ create_dujiao_archive() {
 
   if [[ "$DEPLOY_MODE" == "postgres" ]]; then
     database_name="database.dump"
+    postgres_database="$(dujiao_postgres_database_name)" || die "无法解析应用的 PostgreSQL 数据库名称。"
     CURRENT_STEP="执行 PostgreSQL pg_dump"
     docker exec "$PG_CONTAINER" sh -eu -c \
-      'exec pg_dump --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --format=custom --compress=6' \
+      'database="$1"; database="${database:-${POSTGRES_DB:-${POSTGRES_USER:-postgres}}}"; exec pg_dump --username="${POSTGRES_USER:-postgres}" --dbname="$database" --format=custom --compress=6' \
+      sh "$postgres_database" \
       > "$work/$database_name"
     [[ -s "$work/$database_name" ]] || die "PostgreSQL 导出文件为空。"
     CURRENT_STEP="校验 PostgreSQL dump"
@@ -2050,15 +2459,28 @@ create_dujiao_archive() {
   fi
 
   CURRENT_STEP="打包上传图片"
-  tar -C "$APP_DIR/data" -czf "$work/uploads.tar.gz" -- uploads
+  tar -C "$DUJIAO_UPLOAD_DIR" -czf "$work/uploads.tar.gz" --transform 's,^\.,uploads,' -- .
   tar -tzf "$work/uploads.tar.gz" >/dev/null
   CURRENT_STEP="打包配置文件"
-  config_items=(".env" "config/config.yml" "$(basename "$COMPOSE_FILE")")
-  tar -C "$APP_DIR" -czf "$work/config.tar.gz" -- "${config_items[@]}"
+  config_stage="$work/config-staging"
+  mkdir -p "$config_stage/config"
+  config_member="config.yml"
+  [[ "$DUJIAO_CONFIG_FILE" != "$APP_DIR/config/config.yml" ]] || config_member="config/config.yml"
+  cp -- "$DUJIAO_CONFIG_FILE" "$config_stage/$config_member"
+  config_items=("$config_member")
+  if [[ -f "$APP_DIR/.env" ]]; then
+    cp -- "$APP_DIR/.env" "$config_stage/.env"
+    config_items+=(".env")
+  fi
+  if [[ -n "$COMPOSE_FILE" ]]; then
+    cp -- "$COMPOSE_FILE" "$config_stage/$(basename "$COMPOSE_FILE")"
+    config_items+=("$(basename "$COMPOSE_FILE")")
+  fi
+  tar -C "$config_stage" -czf "$work/config.tar.gz" -- "${config_items[@]}"
   tar -tzf "$work/config.tar.gz" >/dev/null
 
-  app_image="$(docker inspect --format '{{.Config.Image}}' dujiao-next 2>/dev/null || printf 'unknown')"
-  upload_files="$(find "$APP_DIR/data/uploads" -type f | wc -l | tr -d ' ')"
+  app_image="$(docker inspect --format '{{.Config.Image}}' "${DUJIAO_CONTAINER:-dujiao-next}" 2>/dev/null || printf 'unknown')"
+  upload_files="$(find "$DUJIAO_UPLOAD_DIR" -type f | wc -l | tr -d ' ')"
   database_size="$(stat -c %s "$work/$database_name")"
   {
     printf 'backup_manager_version=%s\n' "$VERSION"
@@ -2070,7 +2492,10 @@ create_dujiao_archive() {
     printf 'database_size=%s\n' "$database_size"
     printf 'app_image=%s\n' "$app_image"
     printf 'upload_files=%s\n' "$upload_files"
-    printf 'compose_file=%s\n' "$(basename "$COMPOSE_FILE")"
+    printf 'compose_file=%s\n' "${COMPOSE_FILE##*/}"
+    printf 'source_config=%s\n' "$DUJIAO_CONFIG_FILE"
+    printf 'source_uploads=%s\n' "$DUJIAO_UPLOAD_DIR"
+    [[ "$DEPLOY_MODE" != postgres ]] || printf 'source_database=%s\n' "$postgres_database"
   } > "$work/manifest.txt"
 
   CURRENT_STEP="生成并核对备份校验和"
@@ -2362,7 +2787,7 @@ sync_archive_to_sftp() {
 }
 
 sync_all_archives() {
-  local archive name
+  local archive name needs_upload
   local -a archives
   mapfile -d '' archives < <(
     find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type f \
@@ -2383,6 +2808,17 @@ sync_all_archives() {
   for archive in "${archives[@]}"; do
     name="$(basename "$archive")"
     valid_archive_name "$name" || die "发现异常备份文件名：$name"
+    needs_upload=0
+    if [[ "$OSS_ENABLED" -eq 1 ]] && ! marker_matches "$(archive_marker "$name" oss)" "$(oss_destination_id)"; then
+      needs_upload=1
+    fi
+    if [[ "$SFTP_ENABLED" -eq 1 ]] && ! marker_matches "$(archive_marker "$name" sftp)" "$(sftp_destination_id)"; then
+      needs_upload=1
+    fi
+    if [[ "$needs_upload" -eq 1 && "$archive" != "$CREATED_ARCHIVE" ]]; then
+      CURRENT_STEP="校验待补传的历史备份 $name"
+      verify_archive_file "$archive"
+    fi
     [[ "$OSS_ENABLED" -eq 0 ]] || sync_archive_to_oss "$archive"
     [[ "$SFTP_ENABLED" -eq 0 ]] || sync_archive_to_sftp "$archive"
   done
@@ -2459,6 +2895,7 @@ prune_remote_extras() {
         warn "OSS 中缺少本地保留备份，正在自动补传：$name"
         marker="$(archive_marker "$name" oss)"
         rm -f -- "$marker"
+        [[ "$archive" == "$CREATED_ARCHIVE" ]] || verify_archive_file "$archive"
         sync_archive_to_oss "$archive"
         remote_archives+=("$name")
       fi
@@ -2496,6 +2933,7 @@ prune_remote_extras() {
         warn "SFTP 中缺少本地保留备份，正在自动补传：$name"
         marker="$(archive_marker "$name" sftp)"
         rm -f -- "$marker"
+        [[ "$archive" == "$CREATED_ARCHIVE" ]] || verify_archive_file "$archive"
         sync_archive_to_sftp "$archive"
         remote_archives+=("$name")
       fi
@@ -2578,6 +3016,10 @@ backup_command() {
   CURRENT_STEP="检查备份前环境"
   validate_backup_source
   create_archive
+  PENDING_ARCHIVE="$CREATED_ARCHIVE"
+  CURRENT_STEP="完整校验新备份，确认可以上传及执行保留策略"
+  verify_archive_file "$CREATED_ARCHIVE"
+  PENDING_ARCHIVE=""
   sync_all_archives
   apply_retention
   success "本次完整备份全部成功。"
@@ -2636,8 +3078,11 @@ validate_inner_tar_paths() {
       config)
         case "$member" in
           .env) env_count="$((env_count + 1))" ;;
-          config/config.yml) config_count="$((config_count + 1))" ;;
-          docker-compose.sqlite.yml|docker-compose.postgres.yml) compose_count="$((compose_count + 1))" ;;
+          config/config.yml|config.yml) config_count="$((config_count + 1))" ;;
+          *.yml|*.yaml)
+            [[ "$member" != */* && "$member" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+            compose_count="$((compose_count + 1))"
+            ;;
           *) return 1 ;;
         esac
         ;;
@@ -2658,7 +3103,8 @@ validate_inner_tar_paths() {
     return 1
   fi
   if [[ "$kind" == "config" ]]; then
-    [[ "$count" -eq 3 && "$env_count" -eq 1 && "$config_count" -eq 1 && "$compose_count" -eq 1 ]]
+    [[ "$config_count" -eq 1 && "$env_count" -le 1 && "$compose_count" -le 1 \
+      && "$count" -eq "$((config_count + env_count + compose_count))" ]]
   elif [[ "$kind" == "komari-data" ]]; then
     [[ "$count" -gt 1 && "$komari_db_count" -eq 1 ]]
   else
@@ -2720,7 +3166,8 @@ verify_dujiao_archive_file() {
   if [[ -f "$work/database.sqlite" ]]; then
     [[ "$(sqlite3 "$work/database.sqlite" 'PRAGMA quick_check;')" == "ok" ]] || die "SQLite 数据库完整性校验失败。"
     success "SQLite 数据库 quick_check 通过。"
-  elif load_config && [[ "$DEPLOY_MODE" == "postgres" ]] && docker inspect "$PG_CONTAINER" >/dev/null 2>&1; then
+  elif [[ "$DEPLOY_MODE" == "postgres" ]] && command -v docker >/dev/null 2>&1 \
+    && docker inspect "$PG_CONTAINER" >/dev/null 2>&1; then
     docker exec -i "$PG_CONTAINER" pg_restore --list < "$work/database.dump" >/dev/null
     success "PostgreSQL custom dump 目录校验通过。"
   else
@@ -3036,8 +3483,8 @@ list_remote_backups() {
   if [[ "$SFTP_ENABLED" -eq 1 ]]; then
     heading "SFTP 归档历史：$(sftp_destination_id)"
     validate_sftp_settings
-    sftp_ssh "for p in dujiao-next komari directory mysql; do for f in '$SFTP_REMOTE_DIR'/\$p-????????-??????.tar; do test -f \"\$f\" && stat -c '%y  %s  %n' \"\$f\"; done; done" \
-      | sort -r || true
+    sftp_ssh "for p in dujiao-next komari directory mysql; do for f in '$SFTP_REMOTE_DIR'/\$p-????????-??????.tar; do if test -f \"\$f\"; then stat -c '%y  %s  %n' \"\$f\" || exit; fi; done; done; exit 0" \
+      | sort -r
   fi
   if [[ "$OSS_ENABLED" -eq 0 && "$SFTP_ENABLED" -eq 0 ]]; then
     warn "当前没有启用远端备份。请在统一配置中心启用 OSS、SFTP 或两者。"
@@ -3069,6 +3516,8 @@ print_backup_source_details() {
       printf '任务名称       : Dujiao-Next 发卡完整备份\n'
       printf '应用目录       : %s\n' "$APP_DIR"
       printf '部署模式       : %s\n' "$DEPLOY_MODE"
+      printf '应用配置       : %s\n' "$DUJIAO_CONFIG_FILE"
+      printf '上传目录       : %s\n' "$DUJIAO_UPLOAD_DIR"
       if [[ "$DEPLOY_MODE" == "postgres" ]]; then
         printf '数据库容器     : %s\n' "$PG_CONTAINER"
       else
@@ -3193,6 +3642,19 @@ version_is_newer() {
   [[ "$remote" != "$current" && "$(printf '%s\n%s\n' "$current" "$remote" | sort -V | tail -n 1)" == "$remote" ]]
 }
 
+install_script_atomically() {
+  local source_file="$1" staged rc
+  staged="$(mktemp "$INSTALL_DIR/.script-update.XXXXXX")"
+  if install -o root -g root -m 0700 "$source_file" "$staged" \
+    && bash -n "$staged" && mv -f -- "$staged" "$INSTALLED_SCRIPT"; then
+    return 0
+  else
+    rc="$?"
+    rm -f -- "$staged"
+    return "$rc"
+  fi
+}
+
 update_command() {
   local temporary remote_version proceed
   require_root
@@ -3216,7 +3678,7 @@ update_command() {
     return 0
   fi
   CURRENT_STEP="安装升级脚本"
-  install -o root -g root -m 0700 "$temporary" "$INSTALLED_SCRIPT"
+  install_script_atomically "$temporary"
   bash -n "$INSTALLED_SCRIPT"
   success "升级完成：v$VERSION -> v$remote_version"
 }
@@ -3722,7 +4184,7 @@ install_program_files() {
   CURRENT_STEP="安装备份管理器文件"
   ensure_runtime_dirs
   if [[ "$SELF_PATH" != "$INSTALLED_SCRIPT" ]]; then
-    install -o root -g root -m 0700 "$SELF_PATH" "$INSTALLED_SCRIPT"
+    install_script_atomically "$SELF_PATH"
   else
     chmod 0700 "$INSTALLED_SCRIPT"
     chown root:root "$INSTALLED_SCRIPT"
@@ -3800,15 +4262,17 @@ configure_command() {
 
 self_test() {
   local result
+  set_config_defaults
   BACKUP_TYPE="dujiao"
   DEPLOY_MODE="sqlite"
-  APP_DIR="/opt/dujiao-next"
+  APP_DIR="/__dujiao_backup_self_test__"
   set_deployment_paths
-  [[ "$COMPOSE_FILE" == "/opt/dujiao-next/docker-compose.sqlite.yml" ]]
-  [[ "$DB_FILE" == "/opt/dujiao-next/data/db/dujiao.db" ]]
+  [[ "$COMPOSE_FILE" == "$APP_DIR/docker-compose.sqlite.yml" ]]
+  [[ "$DB_FILE" == "$APP_DIR/data/db/dujiao.db" ]]
   DEPLOY_MODE="postgres"
+  COMPOSE_FILE=""
   set_deployment_paths
-  [[ "$COMPOSE_FILE" == "/opt/dujiao-next/docker-compose.postgres.yml" ]]
+  [[ "$COMPOSE_FILE" == "$APP_DIR/docker-compose.postgres.yml" ]]
   OSS_PREFIX="/dujiao-next/test/"
   result="$(normalize_oss_prefix "$OSS_PREFIX")"
   [[ "$result" == "dujiao-next/test" ]]

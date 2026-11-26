@@ -75,8 +75,6 @@ printf '%s\n' \
   '' \
   '   ' \
   4 \
-  '' \
-  '   ' \
   2 \
   '' \
   '   ' \
@@ -97,14 +95,14 @@ printf '%s\n' \
     -- bash "$repo_dir/dujiao-backup.sh" install
 tr -d '\r' < "$install_transcript" > "$install_output"
 
-grep -Fq '安装 Server Backup Manager v1.3.0' "$install_output"
+grep -Fq '安装 Server Backup Manager v1.3.1' "$install_output"
 grep -Fq '选择备份目标' "$install_output"
 grep -Fq '选择要备份的任务类型' "$install_output"
 grep -Fq '识别 Komari 探针面板 Docker 部署' "$install_output"
 grep -Fq '设置备份保留数量' "$install_output"
 grep -Fq '配置自动备份' "$install_output"
 grep -Fq '安装成功' "$install_output"
-install_line="$(awk 'index($0, "安装 Server Backup Manager v1.3.0") { print NR; exit }' "$install_output")"
+install_line="$(awk 'index($0, "安装 Server Backup Manager v1.3.1") { print NR; exit }' "$install_output")"
 target_line="$(awk 'index($0, "选择备份目标") { print NR; exit }' "$install_output")"
 business_line="$(awk 'index($0, "选择要备份的任务类型") { print NR; exit }' "$install_output")"
 komari_line="$(awk 'index($0, "识别 Komari 探针面板 Docker 部署") { print NR; exit }' "$install_output")"
@@ -118,7 +116,7 @@ success_line="$(awk 'index($0, "安装成功") { print NR; exit }' "$install_out
   && retention_line < timer_line \
   && timer_line < success_line ))
 invalid_count="$(grep -oF '空值或纯空格无效' "$install_output" | wc -l | tr -d ' ')"
-test "$invalid_count" -ge 14
+test "$invalid_count" -ge 12
 if grep -E '(请选择|Komari 容器名|确认使用|最多保留|是否启用|是否现在).*\[(INFO|WARN|SUCCESS|ERROR)\]' "$install_output"; then
   printf 'Interactive prompt and log output were joined on one line.\n' >&2
   exit 1
